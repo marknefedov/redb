@@ -762,6 +762,21 @@ pub(crate) struct TransactionalMemory {
 }
 
 impl TransactionalMemory {
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn metrics_state(&self) -> &crate::commit_metrics::MetricsState {
+        self.storage.metrics_state()
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn set_commit_metrics_enabled(&self, enabled: bool) {
+        self.metrics_state().set_enabled(enabled);
+    }
+
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn commit_metrics(&self) -> crate::CommitMetrics {
+        self.metrics_state().snapshot()
+    }
+
     /// The locks a handle holds for as long as the database is open, taken before anything is
     /// read from the storage.
     fn lock_for_open(

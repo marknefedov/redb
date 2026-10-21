@@ -769,6 +769,8 @@ pub struct Database {
     mem: Arc<TransactionalMemory>,
     transaction_tracker: Arc<TransactionTracker>,
     pub(crate) concurrent_history: crate::sync::Mutex<crate::concurrent::CommitHistory>,
+    #[cfg(not(redb_no_std))]
+    pub(crate) group_commit: Option<crate::group_commit::Coordinator>,
 }
 
 impl Sealed for Database {}
@@ -1650,6 +1652,8 @@ impl Database {
             mem,
             transaction_tracker,
             concurrent_history: crate::sync::Mutex::new(crate::concurrent::CommitHistory::default()),
+            #[cfg(not(redb_no_std))]
+            group_commit: None,
         })
     }
 
@@ -1698,6 +1702,27 @@ impl Database {
     /// Convenience method for [`Builder::new`]
     pub fn builder() -> Builder {
         Builder::new()
+    }
+
+    /// Enable or disable optional commit timing and backend-I/O metrics. Disabled by default.
+    #[cfg(not(redb_no_std))]
+    pub fn set_commit_metrics_enabled(&self, enabled: bool) {
+        self.mem.set_commit_metrics_enabled(enabled);
+    }
+
+    /// Return cumulative commit metrics. Read while workers are idle for consistent counters.
+    #[cfg(not(redb_no_std))]
+    pub fn commit_metrics(&self) -> crate::CommitMetrics {
+        self.mem.commit_metrics()
+    }
+
+    /// Return coordinator gauges and high-water marks, or `None` when grouping is disabled.
+    /// These remain available when optional timing metrics are disabled.
+    #[cfg(not(redb_no_std))]
+    pub fn group_commit_stats(&self) -> Option<crate::GroupCommitStats> {
+        self.group_commit
+            .as_ref()
+            .map(crate::group_commit::Coordinator::stats)
     }
 
     /// Begins a write transaction
@@ -1823,8 +1848,14 @@ fn begin_write_with_allocation_policy(
     mem.check_io_errors()?;
     // The slot ahead of the byte: locks on the byte from one file description are one lock, so
     // the slot is what orders this process's writers. An error return drops both
+    #[cfg(not(redb_no_std))]
+    let wait = mem
+        .metrics_state()
+        .start(crate::commit_metrics::CommitPhase::WriterWait);
     let slot = WriteSlot::take(transaction_tracker.clone());
     let writer_lock = writer_lock.map_or_else(|| mem.lock_writer(), |lent| Ok(lent.clone()))?;
+    #[cfg(not(redb_no_std))]
+    drop(wait);
     let latch = sync_to_latest_commit(mem, &writer_lock, header_lock)?;
     // Re-checked after acquiring the write slot: the writer this call blocked on can fail its
     // commit, latching an I/O error and discarding the allocator state. The I/O check comes
@@ -2064,6 +2095,8 @@ pub struct Builder {
     cache_size: usize,
     concurrency_mode: ConcurrencyMode,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
+    #[cfg(not(redb_no_std))]
+    group_commit: Option<crate::GroupCommitConfig>,
 }
 
 impl Builder {
@@ -2083,7 +2116,34 @@ impl Builder {
             concurrency_mode: ConcurrencyMode::ExclusiveWriter,
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
+            #[cfg(not(redb_no_std))]
+            group_commit: None,
         }
+    }
+
+    /// Enable bounded opportunistic group commit for Immediate optimistic transactions.
+    ///
+    /// Disabled by default. Codecs and comparators may execute on another committing caller's
+    /// thread. Ordinary writers and non-durable optimistic commits keep their existing behavior.
+    /// Requests exceeding either configured byte limit commit alone through the ordinary path.
+    #[cfg(not(redb_no_std))]
+    pub fn set_group_commit(&mut self, config: crate::GroupCommitConfig) -> &mut Self {
+        self.group_commit = Some(config);
+        self
+    }
+
+    fn configure_database(
+        &self,
+        database: Result<Database, DatabaseError>,
+    ) -> Result<Database, DatabaseError> {
+        let database = database?;
+        #[cfg(not(redb_no_std))]
+        let database = {
+            let mut database = database;
+            database.group_commit = self.group_commit.map(crate::group_commit::Coordinator::new);
+            database
+        };
+        Ok(database)
     }
 
     /// Set a callback which will be invoked periodically in the event that the database file needs
@@ -2148,7 +2208,7 @@ impl Builder {
             .truncate(false)
             .open(path)?;
 
-        Database::new(
+        self.configure_database(Database::new(
             Box::new(FileBackend::new(file)?),
             true,
             self.page_size,
@@ -2156,7 +2216,7 @@ impl Builder {
             self.cache_size,
             self.concurrency_mode,
             &self.repair_callback,
-        )
+        ))
     }
 
     /// Opens an existing redb database.
@@ -2164,7 +2224,7 @@ impl Builder {
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        Database::new(
+        self.configure_database(Database::new(
             Box::new(FileBackend::new(file)?),
             false,
             self.page_size,
@@ -2172,7 +2232,7 @@ impl Builder {
             self.cache_size,
             self.concurrency_mode,
             &self.repair_callback,
-        )
+        ))
     }
 
     /// Opens an existing redb database.
@@ -2206,7 +2266,7 @@ impl Builder {
     /// The file must be empty or contain a valid database.
     #[cfg(not(redb_no_std))]
     pub fn create_file(&self, file: File) -> Result<Database, DatabaseError> {
-        Database::new(
+        self.configure_database(Database::new(
             Box::new(FileBackend::new(file)?),
             true,
             self.page_size,
@@ -2214,7 +2274,7 @@ impl Builder {
             self.cache_size,
             self.concurrency_mode,
             &self.repair_callback,
-        )
+        ))
     }
 
     /// Open an existing or create a new database with the given backend.
@@ -2222,7 +2282,7 @@ impl Builder {
         &self,
         backend: impl StorageBackend,
     ) -> Result<Database, DatabaseError> {
-        Database::new(
+        self.configure_database(Database::new(
             Box::new(backend),
             true,
             self.page_size,
@@ -2230,7 +2290,7 @@ impl Builder {
             self.cache_size,
             self.concurrency_mode,
             &self.repair_callback,
-        )
+        ))
     }
 }
 

@@ -95,7 +95,7 @@ bench_space entries='512000' output='space-results.json':
 bench_performance entries='65536' output='performance-results.json':
     REDB_PERF_ENTRIES={{quote(entries)}} REDB_PERF_OUTPUT={{quote(absolute_path(output))}} cargo bench -p redb-bench --bench performance_benchmark
 
-# Classic/concurrent write APIs under independent and hot-key contention.
+# Classic/concurrent/grouped writers, plus a separate instrumented diagnostic run.
 bench_concurrent transactions='1024' output='concurrent-results.json':
     REDB_CONCURRENT_TRANSACTIONS={{quote(transactions)}} REDB_CONCURRENT_OUTPUT={{quote(absolute_path(output))}} cargo bench -p redb-bench --bench concurrent_write_benchmark
 

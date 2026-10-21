@@ -70,6 +70,11 @@
 // std builds.
 extern crate alloc;
 
+#[cfg(not(redb_no_std))]
+pub use commit_metrics::{CommitMetrics, CommitPhaseMetrics};
+#[cfg(not(redb_no_std))]
+pub use group_commit::{GroupCommitConfig, GroupCommitStats};
+
 pub use concurrent::{
     ConcurrentRange, ConcurrentTable, ConcurrentValue, ConcurrentWriteError,
     ConcurrentWriteTransaction,
@@ -107,10 +112,14 @@ pub use types::{Key, MutInPlaceValue, TypeName, Value};
 pub type Result<T = (), E = StorageError> = core::result::Result<T, E>;
 
 pub mod backends;
+#[cfg(not(redb_no_std))]
+mod commit_metrics;
 mod complex_types;
 mod concurrent;
 mod db;
 mod error;
+#[cfg(not(redb_no_std))]
+mod group_commit;
 // Public under the redb 5 API preview, so a backend author can name the error type in both
 // modes; with std it is a re-export of `std::io`
 #[cfg(feature = "experimental-api-5")]

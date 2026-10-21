@@ -45,6 +45,8 @@ are any future changes to it.
 * MVCC support for concurrent readers & writer, without blocking
 * [Optimistic transactions](docs/concurrent-writes.md) that let multiple writers prepare
   changes concurrently, with explicit conflict detection at commit
+* Optional [bounded group commit](docs/group-commit.md) that lets prepared transactions
+  share a durable publication without waiting to fill a batch
 * Crash-safe by default
 * Savepoints and rollbacks
 

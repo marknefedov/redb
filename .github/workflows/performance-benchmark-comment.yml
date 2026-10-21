@@ -2,7 +2,7 @@ name: Performance benchmark comment
 
 on:
   workflow_run:
-    workflows: [Performance benchmark]
+    workflows: [Performance benchmarks]
     types: [completed]
 
 permissions:
@@ -33,7 +33,9 @@ jobs:
           script: |
             const fs = require('fs');
             const run = context.payload.workflow_run;
-            const report = JSON.parse(fs.readFileSync('performance-artifact/performance-results.json', 'utf8'));
+            const artifact = 'performance-artifact/performance-results.json';
+            if (fs.statSync(artifact).size > 256 * 1024) throw new Error('Oversized report');
+            const report = JSON.parse(fs.readFileSync(artifact, 'utf8'));
             if (report.head_sha !== run.head_sha) throw new Error('Mismatched benchmark commit');
             let prs = run.pull_requests;
             if (prs.length === 0) {

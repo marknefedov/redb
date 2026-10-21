@@ -13,6 +13,10 @@ it does not promise parallel disk writes or a fixed commit-latency bound.
 The ordinary `begin_write()` API keeps its existing blocking behavior. Both APIs can be
 used on the same database, and optimistic validation includes ordinary writers' commits.
 
+An optional [bounded group commit](group-commit.md) coordinator lets already waiting
+Immediate transactions share a durable publication. It adds explicit queue and batch
+limits and keeps the default behavior unchanged when disabled.
+
 ## Basic use and conflicts
 
 ```rust

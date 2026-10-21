@@ -1,8 +1,9 @@
-//! Compare serialized writers with optimistic preparation on independent and contended keys.
+//! Compare serialized, optimistic, and grouped writers with separate phase diagnostics.
 use redb::backends::InMemoryBackend;
 use redb::{
-    ConcurrentWriteError, Database, Durability, ReadableDatabase, ReadableTable,
-    ReadableTableMetadata, StorageBackend, TableDefinition,
+    CommitMetrics, CommitPhaseMetrics, ConcurrentWriteError, Database, Durability,
+    GroupCommitConfig, GroupCommitStats, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    StorageBackend, TableDefinition,
 };
 use serde_json::{Value, json};
 use std::hint::black_box;
@@ -35,6 +36,7 @@ impl Mode {
 enum Api {
     Classic,
     Concurrent,
+    Grouped,
 }
 
 impl Api {
@@ -42,8 +44,97 @@ impl Api {
         match self {
             Self::Classic => "classic",
             Self::Concurrent => "concurrent",
+            Self::Grouped => "grouped",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct GroupLimits {
+    batch_transactions: usize,
+    batch_bytes: usize,
+    queue_transactions: usize,
+    queue_bytes: usize,
+}
+
+impl GroupLimits {
+    fn from_environment() -> Self {
+        let result = Self {
+            batch_transactions: number("REDB_GROUP_MAX_BATCH_TRANSACTIONS", 16),
+            batch_bytes: number("REDB_GROUP_MAX_BATCH_BYTES", 1024 * 1024),
+            queue_transactions: number("REDB_GROUP_MAX_QUEUE_TRANSACTIONS", 64),
+            queue_bytes: number("REDB_GROUP_MAX_QUEUE_BYTES", 4 * 1024 * 1024),
+        };
+        assert!(result.batch_transactions > 0 && result.batch_bytes > 0);
+        assert!(result.queue_transactions > 0 && result.queue_bytes > 0);
+        result
+    }
+
+    fn config(self) -> GroupCommitConfig {
+        GroupCommitConfig::default()
+            .with_max_batch_transactions(self.batch_transactions)
+            .with_max_batch_bytes(self.batch_bytes)
+            .with_max_queue_transactions(self.queue_transactions)
+            .with_max_queue_bytes(self.queue_bytes)
+    }
+
+    fn json(self) -> Value {
+        json!({
+            "max_batch_transactions": self.batch_transactions,
+            "max_batch_bytes": self.batch_bytes,
+            "max_queue_transactions": self.queue_transactions,
+            "max_queue_bytes": self.queue_bytes,
+        })
+    }
+}
+
+fn phase_metrics(phase: CommitPhaseMetrics) -> Value {
+    json!({"calls": phase.calls, "total_ns": phase.total_ns, "max_ns": phase.max_ns})
+}
+
+fn commit_metrics(metrics: CommitMetrics) -> Value {
+    json!({
+        "enabled": metrics.enabled,
+        "writer_wait": phase_metrics(metrics.writer_wait),
+        "queue_wait": phase_metrics(metrics.queue_wait),
+        "validation": phase_metrics(metrics.validation),
+        "replay": phase_metrics(metrics.replay),
+        "commit": phase_metrics(metrics.commit),
+        "write": phase_metrics(metrics.write),
+        "sync": phase_metrics(metrics.sync),
+        "physical_commits": metrics.physical_commits,
+        "durable_commits": metrics.durable_commits,
+        "commit_errors": metrics.commit_errors,
+        "written_bytes": metrics.written_bytes,
+        "write_errors": metrics.write_errors,
+        "sync_errors": metrics.sync_errors,
+        "group_batches": metrics.group_batches,
+        "grouped_transactions": metrics.grouped_transactions,
+        "max_group_size": metrics.max_group_size,
+        "conflicts": metrics.conflicts,
+        "queue_rejections": metrics.queue_rejections,
+    })
+}
+
+fn group_stats(stats: Option<GroupCommitStats>) -> Value {
+    stats.map_or(Value::Null, |stats| {
+        assert_eq!(stats.queued_transactions, 0);
+        assert_eq!(stats.queued_bytes, 0);
+        assert_eq!(stats.active_transactions, 0);
+        assert_eq!(stats.active_bytes, 0);
+        json!({
+            "queued_transactions": stats.queued_transactions,
+            "queued_bytes": stats.queued_bytes,
+            "active_transactions": stats.active_transactions,
+            "active_bytes": stats.active_bytes,
+            "max_queued_transactions": stats.max_queued_transactions,
+            "max_queued_bytes": stats.max_queued_bytes,
+            "physical_batches": stats.physical_batches,
+            "committed_transactions": stats.committed_transactions,
+            "max_batch_transactions": stats.max_batch_transactions,
+            "max_batch_bytes": stats.max_batch_bytes,
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -133,11 +224,13 @@ struct Case {
     transactions: usize,
     preparation_reads: usize,
     max_retries: usize,
+    group_limits: GroupLimits,
 }
 
 struct WorkerResult {
     samples: Vec<u64>,
     conflicts: usize,
+    queue_rejections: usize,
 }
 
 fn classic_attempt(db: &Database, references: &[u64], counter: u64) -> Result<(), redb::Error> {
@@ -200,6 +293,7 @@ impl Case {
         let mut result = WorkerResult {
             samples: Vec::with_capacity(self.transactions),
             conflicts: 0,
+            queue_rejections: 0,
         };
         let counter = self.workload.counter_key(writer);
         barrier.wait();
@@ -215,7 +309,7 @@ impl Case {
                 Api::Classic => {
                     classic_attempt(db, &references, counter).map_err(|error| error.to_string())?;
                 }
-                Api::Concurrent => {
+                Api::Concurrent | Api::Grouped => {
                     let mut retries = 0;
                     loop {
                         // Construct each attempt here so every retry receives a fresh snapshot.
@@ -230,6 +324,19 @@ impl Case {
                                     ));
                                 }
                                 retries += 1;
+                            }
+                            Err(ConcurrentWriteError::QueueFull) => {
+                                result.queue_rejections += 1;
+                                if retries == self.max_retries {
+                                    return Err(format!(
+                                        "Writer {writer}, transaction {index} exceeded {} retries after queue rejection",
+                                        self.max_retries
+                                    ));
+                                }
+                                retries += 1;
+                                // QueueFull guarantees no publication. Yield and prepare a fresh
+                                // transaction; this wait remains part of logical latency.
+                                thread::yield_now();
                             }
                             Err(error) => return Err(error.to_string()),
                         }
@@ -281,17 +388,20 @@ impl Case {
         }
     }
 
-    fn run(&self) -> Value {
+    fn measure(&self, instrumented: bool) -> Value {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.redb");
         let memory = SharedMemory(Arc::new(InMemoryBackend::new()));
+        let mut builder = Database::builder();
+        if matches!(self.api, Api::Grouped) {
+            builder.set_group_commit(self.group_limits.config());
+        }
         let mut db = match self.mode {
-            Mode::Memory => Database::builder()
-                .create_with_backend(memory.clone())
-                .unwrap(),
-            Mode::Durable => Database::create(&path).unwrap(),
+            Mode::Memory => builder.create_with_backend(memory.clone()).unwrap(),
+            Mode::Durable => builder.create(&path).unwrap(),
         };
         self.initialize(&db);
+        db.set_commit_metrics_enabled(instrumented);
         let barrier = Barrier::new(self.writers + 1);
         let (elapsed_ns, reports) = thread::scope(|scope| {
             let handles: Vec<_> = (0..self.writers)
@@ -315,7 +425,15 @@ impl Case {
             let elapsed_ns: u64 = timer.elapsed().as_nanos().try_into().unwrap();
             (elapsed_ns, reports)
         });
+        // Capture diagnostics before verification, integrity checks, close, or reopen add work.
+        let metrics = db.commit_metrics();
+        assert_eq!(metrics.enabled, instrumented);
+        if !instrumented {
+            assert_eq!(metrics, CommitMetrics::default());
+        }
+        let groups = group_stats(db.group_commit_stats());
         let conflicts: usize = reports.iter().map(|report| report.conflicts).sum();
+        let queue_rejections: usize = reports.iter().map(|report| report.queue_rejections).sum();
         let mut samples: Vec<_> = reports
             .into_iter()
             .flat_map(|report| report.samples)
@@ -344,26 +462,40 @@ impl Case {
             / u128::from(elapsed_ns))
         .try_into()
         .unwrap();
-        json!({
-            "mode": self.mode.name(),
-            "api": self.api.name(),
-            "workload": self.workload.name(),
-            "writers": self.writers,
+        let mut report = json!({
             "transactions": transactions,
-            "attempts": transactions + conflicts,
+            "attempts": transactions + conflicts + queue_rejections,
             "conflicts": conflicts,
-            "retries": conflicts,
+            "queue_rejections": queue_rejections,
+            "retries": conflicts + queue_rejections,
             "elapsed_ns": elapsed_ns,
             "transactions_per_second": transactions_per_second,
             "latency_ns": {"p50": at(500), "p99": at(990), "p999": at(999), "max": samples.last().unwrap()},
             "backend_bytes": backend_bytes,
-        })
+            "group_stats": groups,
+        });
+        if instrumented {
+            report["commit_metrics"] = commit_metrics(metrics);
+        }
+        report
+    }
+
+    fn run(&self) -> Value {
+        // Timers and atomic counters can perturb short memory transactions. Keep the headline
+        // measurement uninstrumented, and collect phases in a separate, identically sized run.
+        let mut report = self.measure(false);
+        report["diagnostics"] = self.measure(true);
+        report["mode"] = json!(self.mode.name());
+        report["api"] = json!(self.api.name());
+        report["workload"] = json!(self.workload.name());
+        report["writers"] = json!(self.writers);
+        report
     }
 }
 
 fn main() {
     let transactions = number("REDB_CONCURRENT_TRANSACTIONS", 1024);
-    assert!(transactions > 0 && transactions.checked_mul(8).is_some());
+    assert!(transactions > 0 && transactions.checked_mul(16).is_some());
     let preparation_reads = number("REDB_CONCURRENT_PREPARATION_READS", 64);
     assert!(preparation_reads <= REFERENCE_KEYS);
     let max_retries = number("REDB_CONCURRENT_MAX_RETRIES", 16_384);
@@ -387,22 +519,27 @@ fn main() {
         .split(',')
         .map(|writers| writers.parse().expect("Expected writer counts"))
         .collect();
-    assert!(writers.iter().all(|writers| [1, 2, 4, 8].contains(writers)));
+    assert!(
+        writers
+            .iter()
+            .all(|writers| [1, 2, 4, 8, 16].contains(writers))
+    );
     assert!(
         writers
             .iter()
             .enumerate()
             .all(|(index, count)| !writers[..index].contains(count))
     );
+    let group_limits = GroupLimits::from_environment();
     let mut results = Vec::new();
     let mut case_index = 0_usize;
     for &mode in &modes {
         for workload in [Workload::Independent, Workload::HotKey] {
             for &writers in &writers {
-                let apis = if case_index.is_multiple_of(2) {
-                    [Api::Classic, Api::Concurrent]
-                } else {
-                    [Api::Concurrent, Api::Classic]
+                let apis = match case_index % 3 {
+                    0 => [Api::Classic, Api::Concurrent, Api::Grouped],
+                    1 => [Api::Concurrent, Api::Grouped, Api::Classic],
+                    _ => [Api::Grouped, Api::Classic, Api::Concurrent],
                 };
                 case_index += 1;
                 for api in apis {
@@ -414,6 +551,7 @@ fn main() {
                         transactions,
                         preparation_reads,
                         max_retries,
+                        group_limits,
                     }
                     .run();
                     println!("{row}");
@@ -426,7 +564,7 @@ fn main() {
         std::fs::write(
             path,
             serde_json::to_vec_pretty(&json!({
-                "schema": 1,
+                "schema": 2,
                 "transactions_per_writer": transactions,
                 "preparation_reads": preparation_reads,
                 "reference_keys": REFERENCE_KEYS,
@@ -434,6 +572,7 @@ fn main() {
                 "max_retries": max_retries,
                 "modes": modes.iter().map(|mode| mode.name()).collect::<Vec<_>>(),
                 "writers": writers,
+                "group_commit": group_limits.json(),
                 "results": results,
             }))
             .unwrap(),

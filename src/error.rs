@@ -148,7 +148,14 @@ impl Display for StorageError {
     }
 }
 
-impl core::error::Error for StorageError {}
+impl core::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Errors related to opening tables
 #[derive(Debug)]
@@ -272,7 +279,14 @@ impl Display for TableError {
     }
 }
 
-impl core::error::Error for TableError {}
+impl core::error::Error for TableError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Errors related to opening a database
 #[derive(Debug)]
@@ -586,7 +600,14 @@ impl Display for TransactionError {
     }
 }
 
-impl core::error::Error for TransactionError {}
+impl core::error::Error for TransactionError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Errors related to committing transactions
 #[derive(Debug)]
@@ -637,7 +658,14 @@ impl Display for CommitError {
     }
 }
 
-impl core::error::Error for CommitError {}
+impl core::error::Error for CommitError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Errors related to cursors
 #[derive(Debug)]
@@ -684,6 +712,9 @@ impl core::error::Error for CursorError {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// An optional group coordinator rejected or failed an optimistic transaction.
+    #[cfg(not(redb_no_std))]
+    GroupCommit(crate::ConcurrentWriteError),
     /// An optimistic transaction read data that another writer changed.
     ConcurrentWriteConflict {
         table: String,
@@ -773,6 +804,10 @@ impl From<crate::ConcurrentWriteError> for Error {
             crate::ConcurrentWriteError::Transaction(error) => error.into(),
             crate::ConcurrentWriteError::Commit(error) => error.into(),
             crate::ConcurrentWriteError::Durability(error) => error.into(),
+            #[cfg(not(redb_no_std))]
+            error @ (crate::ConcurrentWriteError::QueueFull
+            | crate::ConcurrentWriteError::BatchAborted(_)
+            | crate::ConcurrentWriteError::BatchPanicked) => Self::GroupCommit(error),
         }
     }
 }
@@ -795,6 +830,8 @@ impl Display for Error {
             Error::ConcurrentWriteConflict { table } => {
                 write!(f, "Concurrent write conflict in table {table}")
             }
+            #[cfg(not(redb_no_std))]
+            Error::GroupCommit(error) => error.fmt(f),
             Error::Unsupported => BackendError::Unsupported.fmt(f),
             Error::Corrupted(msg) => {
                 write!(f, "DB corrupted: {msg}")
@@ -942,4 +979,13 @@ impl Display for Error {
     }
 }
 
-impl core::error::Error for Error {}
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            #[cfg(not(redb_no_std))]
+            Self::GroupCommit(error) => Some(error),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}

@@ -1,3 +1,5 @@
+#[cfg(not(redb_no_std))]
+use crate::commit_metrics::{CommitPhase, MetricsState};
 use crate::db::StorageBackend;
 use crate::sync::{Mutex, MutexGuard, RwLock};
 use crate::transaction_tracker::TransactionId;
@@ -126,6 +128,8 @@ struct CheckedBackend {
     file: Box<dyn StorageBackend>,
     io_failed: AtomicBool,
     closed: AtomicBool,
+    #[cfg(not(redb_no_std))]
+    metrics: MetricsState,
 }
 
 // Covers the open paths that fail before there is a Database to drop. Drop cannot report the
@@ -144,6 +148,8 @@ impl CheckedBackend {
             file,
             io_failed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            #[cfg(not(redb_no_std))]
+            metrics: MetricsState::default(),
         }
     }
 
@@ -241,7 +247,13 @@ impl CheckedBackend {
 
     fn sync_data(&self) -> Result<()> {
         self.check_failure()?;
+        #[cfg(not(redb_no_std))]
+        let timer = self.metrics.start(CommitPhase::Sync);
         let result = self.file.sync_data();
+        #[cfg(not(redb_no_std))]
+        if let Some(timer) = timer {
+            timer.complete(result.is_ok());
+        }
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
@@ -250,7 +262,13 @@ impl CheckedBackend {
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_failure()?;
+        #[cfg(not(redb_no_std))]
+        let timer = self.metrics.start(CommitPhase::Write);
         let result = self.file.write(offset, data);
+        #[cfg(not(redb_no_std))]
+        if let Some(timer) = timer {
+            timer.complete_write(result.is_ok(), data.len());
+        }
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
@@ -262,7 +280,14 @@ impl CheckedBackend {
     // over data that nothing was waiting on.
     fn write_best_effort(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_failure()?;
-        self.file.write(offset, data).map_err(StorageError::from)
+        #[cfg(not(redb_no_std))]
+        let timer = self.metrics.start(CommitPhase::Write);
+        let result = self.file.write(offset, data);
+        #[cfg(not(redb_no_std))]
+        if let Some(timer) = timer {
+            timer.complete_write(result.is_ok(), data.len());
+        }
+        result.map_err(StorageError::from)
     }
 }
 
@@ -336,6 +361,11 @@ pub(super) struct PagedCachedFile {
 }
 
 impl PagedCachedFile {
+    #[cfg(not(redb_no_std))]
+    pub(crate) fn metrics_state(&self) -> &MetricsState {
+        &self.file.metrics
+    }
+
     pub(super) fn new(
         file: Box<dyn StorageBackend>,
         page_size: u64,

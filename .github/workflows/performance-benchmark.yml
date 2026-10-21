@@ -1,4 +1,4 @@
-name: Performance benchmark
+name: Performance benchmarks
 
 on:
   pull_request:
@@ -30,10 +30,14 @@ jobs:
       REDB_PERF_MODES: memory,durable
       REDB_PERF_VALUES: 150,4096
       REDB_CONCURRENT_MODES: memory,durable
-      REDB_CONCURRENT_WRITERS: 1,2,4
+      REDB_CONCURRENT_WRITERS: 1,2,4,8,16
       REDB_CONCURRENT_TRANSACTIONS: 1024
       REDB_CONCURRENT_PREPARATION_READS: 64
       REDB_CONCURRENT_MAX_RETRIES: 16384
+      REDB_GROUP_MAX_BATCH_TRANSACTIONS: 16
+      REDB_GROUP_MAX_BATCH_BYTES: 1048576
+      REDB_GROUP_MAX_QUEUE_TRANSACTIONS: 64
+      REDB_GROUP_MAX_QUEUE_BYTES: 4194304
     steps:
       - uses: actions/checkout@v6
         with:
@@ -131,6 +135,7 @@ jobs:
           key: ${{ steps.bench-cache.outputs.cache-primary-key }}
       - name: Compare sequential counterbalanced runs
         env:
+          TMPDIR: ${{ runner.temp }}
           BASE_SHA: ${{ steps.revisions.outputs.base }}
           HEAD_SHA: ${{ steps.revisions.outputs.head }}
         run: |
@@ -273,42 +278,150 @@ jobs:
             lines.push('', 'Both backends use Immediate commits. Memory isolates engine CPU work; durable uses a file with synchronous commits. Write batch latency includes begin, mutations, and commit; read batch latency covers lookups in one held snapshot. Churn counts each removal and insertion as an operation. Dataset generation and verification are outside timing. Shared-runner timing is diagnostic; there is no performance gate. The separate space benchmark keeps its 1.5x size gate.');
             if (Object.prototype.hasOwnProperty.call(data, 'concurrent')) {
               const report = data.concurrent;
-              if (number(report.schema) !== 1 || number(report.value_bytes) !== 150) throw new Error('Invalid writer schema');
-              const transactions = number(report.transactions_per_writer, 1);
-              const references = number(report.reference_keys, 1), preparation = number(report.preparation_reads, 0, references);
-              const retryLimit = number(report.max_retries);
-              const modes = choices(report.modes, ['memory', 'durable']), writers = choices(report.writers, [1, 2, 4, 8]);
-              const apis = ['classic', 'concurrent'], workloads = ['independent', 'hot_key'];
-              if (!Array.isArray(report.results) || report.results.length !== modes.length * writers.length * apis.length * workloads.length)
-                throw new Error('Incomplete writer results');
-              const grouped = new Map();
-              for (const row of report.results) {
-                const count = number(row.writers, 1);
-                if (!modes.includes(row.mode) || !apis.includes(row.api) || !workloads.includes(row.workload) || !writers.includes(count))
-                  throw new Error('Invalid writer workload');
-                const key = `${row.mode}/${row.workload}/${count}/${row.api}`;
-                if (grouped.has(key)) throw new Error('Duplicate writer workload');
-                const total = number(row.transactions, 1), attempts = number(row.attempts, 1);
-                const conflicts = number(row.conflicts), retries = number(row.retries);
-                const elapsed = number(row.elapsed_ns, 1), rate = number(row.transactions_per_second, 1);
-                const bytes = number(row.backend_bytes, 1);
-                const latency = ['p50', 'p99', 'p999', 'max'].map(name => number(row.latency_ns[name]));
-                if (total !== transactions * count || attempts !== total + conflicts || retries !== conflicts ||
-                    BigInt(retries) > BigInt(total) * BigInt(retryLimit) || (row.api === 'classic' && conflicts !== 0) ||
-                    BigInt(rate) !== BigInt(total) * 1000000000n / BigInt(elapsed) ||
-                    latency.some((value, i) => i && value < latency[i - 1])) throw new Error('Inconsistent writer result');
-                grouped.set(key, {rate, attempts, conflicts, bytes, latency});
-              }
-              lines.push('', '### Head-only writer contention', '',
-                `${transactions} committed transactions per writer; ${preparation} preparation reads from ${references} reference keys per attempt; 150-byte values; at most ${retryLimit} retries per logical transaction.`,
-                'Both APIs use Immediate commits. Independent writers update separate counters; hot-key writers share a counter. Latency includes all retries for each committed logical transaction. This compares APIs on the head commit, not against the base commit.', '',
-                '| Backend | Workload | Writers | Classic tx/s | Concurrent tx/s | Concurrent/classic | Conflicts / attempts | Classic p99 / p99.9 / max ms | Concurrent p99 / p99.9 / max ms | Classic / concurrent KiB |',
-                '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|');
-              for (const mode of modes) for (const workload of workloads) for (const count of writers) {
-                const classic = grouped.get(`${mode}/${workload}/${count}/classic`);
-                const concurrent = grouped.get(`${mode}/${workload}/${count}/concurrent`);
-                const tails = [classic, concurrent].map(row => row.latency.slice(1).map(value => (value / 1000000).toFixed(3)).join(' / '));
-                lines.push(`| ${mode} | ${workload} | ${count} | ${classic.rate} | ${concurrent.rate} | ${(concurrent.rate / classic.rate).toFixed(3)}x | ${concurrent.conflicts} / ${concurrent.attempts} | ${tails[0]} | ${tails[1]} | ${(classic.bytes / 1024).toFixed(1)} / ${(concurrent.bytes / 1024).toFixed(1)} |`);
+              if (number(report.schema) === 2) {
+                if (number(report.value_bytes) !== 150) throw new Error('Invalid writer values');
+                const transactions = number(report.transactions_per_writer, 1);
+                const references = number(report.reference_keys, 1), preparation = number(report.preparation_reads, 0, references);
+                const retryLimit = number(report.max_retries);
+                const modes = choices(report.modes, ['memory', 'durable']), writers = choices(report.writers, [1, 2, 4, 8, 16]);
+                const apis = ['classic', 'concurrent', 'grouped'], workloads = ['independent', 'hot_key'];
+                const phaseNames = ['writer_wait', 'queue_wait', 'validation', 'replay', 'commit', 'write', 'sync'];
+                const counterNames = ['physical_commits', 'durable_commits', 'commit_errors', 'written_bytes', 'write_errors', 'sync_errors', 'group_batches', 'grouped_transactions', 'max_group_size', 'conflicts', 'queue_rejections'];
+                const limits = Object.fromEntries(['max_batch_transactions', 'max_batch_bytes', 'max_queue_transactions', 'max_queue_bytes'].map(name => [name, number(report.group_commit[name], 1)]));
+                const groupStats = (stats, api) => {
+                  if (api !== 'grouped') {
+                    if (stats !== null) throw new Error('Unexpected group statistics');
+                    return null;
+                  }
+                  if (!stats || typeof stats !== 'object' || Array.isArray(stats)) throw new Error('Missing group statistics');
+                  const result = Object.fromEntries(['queued_transactions', 'queued_bytes', 'active_transactions', 'active_bytes', 'max_queued_transactions', 'max_queued_bytes', 'physical_batches', 'committed_transactions', 'max_batch_transactions', 'max_batch_bytes'].map(name => [name, number(stats[name])]));
+                  if (['queued_transactions', 'queued_bytes', 'active_transactions', 'active_bytes'].some(name => result[name] !== 0) ||
+                      result.max_queued_transactions > limits.max_queue_transactions || result.max_queued_bytes > limits.max_queue_bytes ||
+                      result.max_batch_transactions > limits.max_batch_transactions || result.max_batch_bytes > limits.max_batch_bytes ||
+                      result.committed_transactions < result.physical_batches ||
+                      BigInt(result.committed_transactions) > BigInt(result.physical_batches) * BigInt(result.max_batch_transactions) ||
+                      ((result.physical_batches === 0) !== (result.max_batch_transactions === 0))) throw new Error('Nonempty or over-budget group queue');
+                  return result;
+                };
+                const diagnosticMetrics = (metrics, api, conflicts, rejections) => {
+                  if (!metrics || metrics.enabled !== true) throw new Error('Diagnostic metrics must be enabled');
+                  const result = {};
+                  for (const name of phaseNames) {
+                    const phase = Object.fromEntries(['calls', 'total_ns', 'max_ns'].map(field => [field, number(metrics[name][field])]));
+                    if (phase.max_ns > phase.total_ns || (phase.calls === 0 && (phase.total_ns !== 0 || phase.max_ns !== 0))) throw new Error('Inconsistent phase metrics');
+                    result[name] = phase;
+                  }
+                  for (const name of counterNames) result[name] = number(metrics[name]);
+                  if (result.durable_commits > result.physical_commits || result.commit_errors > result.commit.calls ||
+                      result.write_errors > result.write.calls || result.sync_errors > result.sync.calls ||
+                      result.conflicts !== conflicts || result.queue_rejections !== rejections ||
+                      result.grouped_transactions < result.group_batches || BigInt(result.grouped_transactions) > BigInt(result.group_batches) * BigInt(result.max_group_size) || result.max_group_size > limits.max_batch_transactions ||
+                      ((result.group_batches === 0) !== (result.max_group_size === 0)) ||
+                      (api !== 'grouped' && ['group_batches', 'grouped_transactions', 'max_group_size'].some(name => result[name] !== 0))) throw new Error('Inconsistent diagnostic counters');
+                  return result;
+                };
+                const sample = (row, count, api, diagnostic) => {
+                  const total = number(row.transactions, 1), attempts = number(row.attempts, 1);
+                  const conflicts = number(row.conflicts), rejections = number(row.queue_rejections), retries = number(row.retries);
+                  const elapsed = number(row.elapsed_ns, 1), rate = number(row.transactions_per_second, 1), bytes = number(row.backend_bytes, 1);
+                  const latency = ['p50', 'p99', 'p999', 'max'].map(name => number(row.latency_ns[name]));
+                  if (BigInt(total) !== BigInt(transactions) * BigInt(count) ||
+                      BigInt(attempts) !== BigInt(total) + BigInt(conflicts) + BigInt(rejections) ||
+                      BigInt(retries) !== BigInt(conflicts) + BigInt(rejections) || BigInt(retries) > BigInt(total) * BigInt(retryLimit) ||
+                      (api === 'classic' && conflicts !== 0) || (api !== 'grouped' && rejections !== 0) ||
+                      BigInt(rate) !== BigInt(total) * 1000000000n / BigInt(elapsed) || latency.some((value, i) => i && value < latency[i - 1])) throw new Error('Inconsistent writer result');
+                  const result = {transactions: total, rate, attempts, conflicts, rejections, bytes, latency, groupStats: groupStats(row.group_stats, api)};
+                  const stats = result.groupStats;
+                  if (stats && (stats.committed_transactions > total || stats.max_batch_transactions > count || stats.max_queued_transactions > count)) throw new Error('Impossible grouped transaction counts');
+                  if (diagnostic) {
+                    result.metrics = diagnosticMetrics(row.commit_metrics, api, conflicts, rejections);
+                    if (stats && (result.metrics.group_batches !== stats.physical_batches || result.metrics.grouped_transactions !== stats.committed_transactions || result.metrics.max_group_size > stats.max_batch_transactions)) throw new Error('Group diagnostics do not match coordinator statistics');
+                  }
+                  else if (Object.prototype.hasOwnProperty.call(row, 'commit_metrics')) throw new Error('Primary throughput must not include instrumentation');
+                  return result;
+                };
+                if (!Array.isArray(report.results) || report.results.length !== modes.length * writers.length * apis.length * workloads.length) throw new Error('Incomplete writer results');
+                const grouped = new Map();
+                for (const row of report.results) {
+                  const count = number(row.writers, 1);
+                  if (!modes.includes(row.mode) || !apis.includes(row.api) || !workloads.includes(row.workload) || !writers.includes(count)) throw new Error('Invalid writer workload');
+                  const key = `${row.mode}/${row.workload}/${count}/${row.api}`;
+                  if (grouped.has(key)) throw new Error('Duplicate writer workload');
+                  grouped.set(key, {primary: sample(row, count, row.api, false), diagnostic: sample(row.diagnostics, count, row.api, true)});
+                }
+                lines.push('', '### Head-only writer contention', '',
+                  `${transactions} committed transactions per writer; ${preparation} preparation reads from ${references} reference keys per attempt; 150-byte values; at most ${retryLimit} retries per logical transaction.`,
+                  'All APIs use Immediate commits. Independent writers update separate counters; hot-key writers share a counter. Primary throughput and latency use metrics disabled. Latency includes conflict and queue-full retries. Each diagnostic measurement uses a separate fresh database with metrics enabled; its timing is not blended into primary results. These compare APIs on the head commit, not against the base commit.',
+                  `Group limits: ${limits.max_batch_transactions} transactions / ${limits.max_batch_bytes} accounted prepared bytes per batch; ${limits.max_queue_transactions} transactions / ${limits.max_queue_bytes} accounted prepared bytes queued. Grouping is opportunistic, with no added collection delay. Selected batch peaks include validation losers; accepted sizes count successful transactions.`, '',
+                  '| Backend | Workload | Writers | API | tx/s | vs classic | Conflicts / queue full / attempts | p99 / p99.9 / max ms | KiB | Commits / accepted tx / max selected |',
+                  '|---|---|---:|---|---:|---:|---:|---:|---:|---:|');
+                for (const mode of modes) for (const workload of workloads) for (const count of writers) {
+                  const classic = grouped.get(`${mode}/${workload}/${count}/classic`).primary;
+                  for (const api of apis) {
+                    const row = grouped.get(`${mode}/${workload}/${count}/${api}`).primary, stats = row.groupStats;
+                    const tails = row.latency.slice(1).map(value => (value / 1000000).toFixed(3)).join(' / ');
+                    const groups = stats ? `${stats.physical_batches} / ${stats.committed_transactions} / ${stats.max_batch_transactions}` : '-';
+                    lines.push(`| ${mode} | ${workload} | ${count} | ${api} | ${row.rate} | ${(row.rate / classic.rate).toFixed(3)}x | ${row.conflicts} / ${row.rejections} / ${row.attempts} | ${tails} | ${(row.bytes / 1024).toFixed(1)} | ${groups} |`);
+                  }
+                }
+                lines.push('', '### Separate instrumented run: I/O and grouping', '',
+                  'Backend sync counts include synchronization during growth and maintenance. Memory backends implement these calls without disk I/O. Written bytes include page and metadata traffic; they are not logical payload bytes.', '',
+                  '| Backend | Workload | Writers | API | Diagnostic tx/s | Physical commits | Sync calls | tx/sync | Written KiB | Groups / accepted tx / max accepted | Peak queued tx / KiB |',
+                  '|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|');
+                const phaseLines = ['', '### Separate instrumented run: phase mean / max us', '',
+                  'Phase totals overlap: commit includes writes and synchronization, and waits from different threads overlap. Do not add phase times as an elapsed-time breakdown. Phase maxima are observed timings, not latency guarantees. Raw JSON preserves every phase call count and total time.', '',
+                  '| Backend | Workload | Writers | API | Writer wait | Queue wait | Validation | Replay | Commit | Write | Sync |',
+                  '|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|'];
+                for (const mode of modes) for (const workload of workloads) for (const count of writers) for (const api of apis) {
+                  const row = grouped.get(`${mode}/${workload}/${count}/${api}`).diagnostic, metrics = row.metrics, stats = row.groupStats;
+                  const syncs = metrics.sync.calls, ratio = syncs ? (row.transactions / syncs).toFixed(3) : 'n/a';
+                  const peak = stats ? `${stats.max_queued_transactions} / ${(stats.max_queued_bytes / 1024).toFixed(1)}` : '-';
+                  lines.push(`| ${mode} | ${workload} | ${count} | ${api} | ${row.rate} | ${metrics.physical_commits} | ${syncs} | ${ratio} | ${(metrics.written_bytes / 1024).toFixed(1)} | ${metrics.group_batches} / ${metrics.grouped_transactions} / ${metrics.max_group_size} | ${peak} |`);
+                  const phases = phaseNames.map(name => {
+                    const phase = metrics[name], mean = phase.calls ? phase.total_ns / phase.calls / 1000 : 0;
+                    return `${mean.toFixed(3)} / ${(phase.max_ns / 1000).toFixed(3)}`;
+                  });
+                  phaseLines.push(`| ${mode} | ${workload} | ${count} | ${api} | ${phases.join(' | ')} |`);
+                }
+                lines.push(...phaseLines);
+              } else {
+                if (number(report.schema) !== 1 || number(report.value_bytes) !== 150) throw new Error('Invalid writer schema');
+                const transactions = number(report.transactions_per_writer, 1);
+                const references = number(report.reference_keys, 1), preparation = number(report.preparation_reads, 0, references);
+                const retryLimit = number(report.max_retries);
+                const modes = choices(report.modes, ['memory', 'durable']), writers = choices(report.writers, [1, 2, 4, 8]);
+                const apis = ['classic', 'concurrent'], workloads = ['independent', 'hot_key'];
+                if (!Array.isArray(report.results) || report.results.length !== modes.length * writers.length * apis.length * workloads.length)
+                  throw new Error('Incomplete writer results');
+                const grouped = new Map();
+                for (const row of report.results) {
+                  const count = number(row.writers, 1);
+                  if (!modes.includes(row.mode) || !apis.includes(row.api) || !workloads.includes(row.workload) || !writers.includes(count))
+                    throw new Error('Invalid writer workload');
+                  const key = `${row.mode}/${row.workload}/${count}/${row.api}`;
+                  if (grouped.has(key)) throw new Error('Duplicate writer workload');
+                  const total = number(row.transactions, 1), attempts = number(row.attempts, 1);
+                  const conflicts = number(row.conflicts), retries = number(row.retries);
+                  const elapsed = number(row.elapsed_ns, 1), rate = number(row.transactions_per_second, 1);
+                  const bytes = number(row.backend_bytes, 1);
+                  const latency = ['p50', 'p99', 'p999', 'max'].map(name => number(row.latency_ns[name]));
+                  if (total !== transactions * count || attempts !== total + conflicts || retries !== conflicts ||
+                      BigInt(retries) > BigInt(total) * BigInt(retryLimit) || (row.api === 'classic' && conflicts !== 0) ||
+                      BigInt(rate) !== BigInt(total) * 1000000000n / BigInt(elapsed) ||
+                      latency.some((value, i) => i && value < latency[i - 1])) throw new Error('Inconsistent writer result');
+                  grouped.set(key, {rate, attempts, conflicts, bytes, latency});
+                }
+                lines.push('', '### Head-only writer contention', '',
+                  `${transactions} committed transactions per writer; ${preparation} preparation reads from ${references} reference keys per attempt; 150-byte values; at most ${retryLimit} retries per logical transaction.`,
+                  'Both APIs use Immediate commits. Independent writers update separate counters; hot-key writers share a counter. Latency includes all retries for each committed logical transaction. This compares APIs on the head commit, not against the base commit.', '',
+                  '| Backend | Workload | Writers | Classic tx/s | Concurrent tx/s | Concurrent/classic | Conflicts / attempts | Classic p99 / p99.9 / max ms | Concurrent p99 / p99.9 / max ms | Classic / concurrent KiB |',
+                  '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|');
+                for (const mode of modes) for (const workload of workloads) for (const count of writers) {
+                  const classic = grouped.get(`${mode}/${workload}/${count}/classic`);
+                  const concurrent = grouped.get(`${mode}/${workload}/${count}/concurrent`);
+                  const tails = [classic, concurrent].map(row => row.latency.slice(1).map(value => (value / 1000000).toFixed(3)).join(' / '));
+                  lines.push(`| ${mode} | ${workload} | ${count} | ${classic.rate} | ${concurrent.rate} | ${(concurrent.rate / classic.rate).toFixed(3)}x | ${concurrent.conflicts} / ${concurrent.attempts} | ${tails[0]} | ${tails[1]} | ${(classic.bytes / 1024).toFixed(1)} / ${(concurrent.bytes / 1024).toFixed(1)} |`);
+                }
               }
             }
             const issue_number = context.issue.number;

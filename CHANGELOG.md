@@ -1,6 +1,8 @@
 # redb - Changelog
 
 ## 5.0.0 - 2026-XX-XX
+* Add opt-in bounded group commit for optimistic writers and optional commit-phase metrics.
+  Ready transactions can share a durable publication; queue and batch limits control admission.
 * Add optimistic write transactions through `Database::begin_concurrent_write()`. Writers can
   prepare changes concurrently; commit validates read dependencies and reports conflicts for retry.
 * Improve allocation availability checks and add repeatable throughput and tail-latency benchmarks.

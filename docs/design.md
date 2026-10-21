@@ -9,6 +9,9 @@ concurrent readers. redb uses MVCC to provide serializable isolation. Physical w
 are applied sequentially. [Optimistic write transactions](concurrent-writes.md) can prepare
 changes concurrently against pinned snapshots, then validate their read dependencies before
 applying and publishing those changes through the ordinary writer.
+With [bounded group commit](group-commit.md) enabled, already waiting optimistic transactions
+can share one physical write transaction and durable root publication. Every accepted member
+is validated against committed state and earlier accepted writes before replay begins.
 
 Each table is a key-value mapping providing an interface similar to `BTreeMap`.
 

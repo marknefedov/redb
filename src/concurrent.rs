@@ -1,5 +1,7 @@
 //! Optimistic write transactions with private, owned changes.
 
+#[cfg(not(redb_no_std))]
+use crate::commit_metrics::CommitPhase;
 use crate::transaction_tracker::TransactionId;
 #[cfg(not(feature = "experimental-api-5"))]
 use crate::tree_store::encode_bounds;
@@ -43,6 +45,16 @@ pub enum ConcurrentWriteError {
     Commit(CommitError),
     /// The selected durability cannot be used for this database.
     Durability(SetDurabilityError),
+    /// The configured group-commit queue is full. This transaction made no storage changes.
+    #[cfg(not(redb_no_std))]
+    QueueFull,
+    /// A shared batch failed. Inspect the cause; a commit I/O error may already be durable.
+    /// This error must not be retried automatically as a conflict.
+    #[cfg(not(redb_no_std))]
+    BatchAborted(alloc::sync::Arc<ConcurrentWriteError>),
+    /// The batch leader panicked. Its publication may have completed; do not retry as a conflict.
+    #[cfg(not(redb_no_std))]
+    BatchPanicked,
 }
 
 impl Display for ConcurrentWriteError {
@@ -54,11 +66,32 @@ impl Display for ConcurrentWriteError {
             Self::Transaction(error) => Display::fmt(error, f),
             Self::Commit(error) => Display::fmt(error, f),
             Self::Durability(error) => Display::fmt(error, f),
+            #[cfg(not(redb_no_std))]
+            Self::QueueFull => f.write_str("The group-commit queue is full"),
+            #[cfg(not(redb_no_std))]
+            Self::BatchAborted(error) => write!(f, "Group commit failed: {error}"),
+            #[cfg(not(redb_no_std))]
+            Self::BatchPanicked => {
+                f.write_str("The group-commit leader panicked; publication is uncertain")
+            }
         }
     }
 }
 
-impl core::error::Error for ConcurrentWriteError {}
+impl core::error::Error for ConcurrentWriteError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::Table(error) => Some(error),
+            Self::Transaction(error) => Some(error),
+            Self::Commit(error) => Some(error),
+            Self::Durability(error) => Some(error),
+            #[cfg(not(redb_no_std))]
+            Self::BatchAborted(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 macro_rules! from_error {
     ($source:ty, $variant:ident) => {
@@ -338,10 +371,10 @@ struct Footprint {
 impl Footprint {
     // Check the entire footprint before allocating its copies. Large transactions simply
     // forgo the cache; they never trigger an unbounded history allocation or eviction pass.
-    fn new(tables: &BTreeMap<String, TableState>) -> Option<Self> {
+    fn new<'a>(tables: impl Iterator<Item = (&'a String, &'a TableState)> + Clone) -> Option<Self> {
         let mut bytes = size_of::<CommitRecord>();
         let mut written_tables = 0;
-        for (name, state) in tables {
+        for (name, state) in tables.clone() {
             let mut any_written = false;
             for (key, observed) in &state.observations {
                 if matches!(observed.change, Change::Read) {
@@ -600,25 +633,67 @@ impl<'db> ConcurrentWriteTransaction<'db> {
     /// A conflict commits none of this transaction's changes. Other commit errors have the
     /// same durability and recovery contract as [`WriteTransaction::commit`].
     pub fn commit(self) -> Result<(), ConcurrentWriteError> {
-        let footprint = Footprint::new(&self.tables);
-        let mut writer = self.database.begin_write()?;
+        let Self {
+            database,
+            snapshot,
+            tables,
+            catalog_reads,
+            durability,
+        } = self;
+        let prepared = PreparedWrite {
+            snapshot,
+            tables,
+            catalog_reads,
+            durability,
+        };
+        #[cfg(not(redb_no_std))]
+        if matches!(durability, Durability::Immediate)
+            && let Some(coordinator) = &database.group_commit
+        {
+            return coordinator.commit(database, prepared);
+        }
+        let result = prepared.commit_alone(database);
+        #[cfg(not(redb_no_std))]
+        if matches!(&result, Err(ConcurrentWriteError::Conflict { .. })) {
+            database.get_memory().metrics_state().record_conflict();
+        }
+        result
+    }
+
+    /// Discard the private changes. Dropping the transaction has the same effect.
+    pub fn abort(self) {}
+}
+
+/// Owned request data; unlike the public handle this has no borrowed database reference.
+pub(crate) struct PreparedWrite {
+    snapshot: ReadTransaction,
+    tables: BTreeMap<String, TableState>,
+    catalog_reads: BTreeMap<String, Option<InternalTableDefinition>>,
+    durability: Durability,
+}
+
+impl PreparedWrite {
+    pub(crate) fn commit_alone(self, database: &Database) -> Result<(), ConcurrentWriteError> {
+        let footprint = Footprint::new(self.tables.iter());
+        #[cfg(not(redb_no_std))]
+        let memory = database.get_memory();
+        let mut writer = database.begin_write()?;
         writer.set_durability(self.durability)?;
         // Take the writer slot before history: a waiting writer must never hold history
         // while the committing writer needs it to finish publication.
-        let mut history = match self.database.concurrent_history.lock() {
+        let mut history = match database.concurrent_history.lock() {
             Ok(history) => history,
             Err(poisoned) => {
                 let mut history = poisoned.into_inner();
                 history.clear();
                 #[cfg(not(redb_no_std))]
-                self.database.concurrent_history.clear_poison();
+                database.concurrent_history.clear_poison();
                 history
             }
         };
-        let latest = self
-            .database
-            .begin_read()
-            .inspect_err(|_| history.clear())?;
+        let latest = database.begin_read().inspect_err(|_| history.clear())?;
+        #[cfg(not(redb_no_std))]
+        let validation = memory.metrics_state().start(CommitPhase::Validation);
         let previous = latest.snapshot_id();
         let covered = history.covered(self.snapshot.snapshot_id(), previous);
         for (name, expected) in &self.catalog_reads {
@@ -637,14 +712,20 @@ impl<'db> ConcurrentWriteTransaction<'db> {
                 (state.validate)(&latest, name, state, current.as_ref(), unchanged_keys)?;
             }
         }
+        #[cfg(not(redb_no_std))]
+        drop(validation);
         drop(latest);
         if !self.tables.values().any(TableState::has_writes) {
             writer.abort().inspect_err(|_| history.clear())?;
             return Ok(());
         }
+        #[cfg(not(redb_no_std))]
+        let replay = memory.metrics_state().start(CommitPhase::Replay);
         for (name, state) in &self.tables {
             (state.apply)(&writer, name, state).inspect_err(|_| history.clear())?;
         }
+        #[cfg(not(redb_no_std))]
+        drop(replay);
         drop(self.snapshot);
         let (committed, writer) = match writer.commit_and_hold() {
             Ok(result) => result,
@@ -660,9 +741,251 @@ impl<'db> ConcurrentWriteTransaction<'db> {
         drop(writer);
         Ok(())
     }
+}
 
-    /// Discard the private changes. Dropping the transaction has the same effect.
-    pub fn abort(self) {}
+#[cfg(not(redb_no_std))]
+pub(crate) struct BatchOutcome {
+    pub(crate) results: Vec<Result<(), ConcurrentWriteError>>,
+    pub(crate) published: bool,
+}
+
+#[cfg(not(redb_no_std))]
+impl PreparedWrite {
+    // Account all owned buffers, including read preimages, plus a conservative allowance
+    // for BTreeMap node slots. Shared cache pages and allocator/RSS overhead are separate.
+    pub(crate) fn accounted_bytes(&self) -> usize {
+        fn node_bytes<K, V>() -> usize {
+            size_of::<(K, V)>().saturating_mul(12).saturating_add(128)
+        }
+        fn definition_bytes(definition: Option<&InternalTableDefinition>) -> usize {
+            match definition {
+                Some(
+                    InternalTableDefinition::Normal {
+                        key_type,
+                        value_type,
+                        ..
+                    }
+                    | InternalTableDefinition::Multimap {
+                        key_type,
+                        value_type,
+                        ..
+                    },
+                ) => key_type
+                    .name()
+                    .len()
+                    .saturating_add(value_type.name().len()),
+                None => 0,
+            }
+        }
+        let mut bytes = size_of::<Self>().saturating_add(256);
+        for (name, state) in &self.tables {
+            bytes = bytes
+                .saturating_add(node_bytes::<String, TableState>())
+                .saturating_add(name.capacity())
+                .saturating_add(state.key_type.name().len())
+                .saturating_add(state.value_type.name().len())
+                .saturating_add(definition_bytes(state.definition.as_ref()));
+            for (key, observed) in &state.observations {
+                bytes = bytes
+                    .saturating_add(node_bytes::<EncodedKey, ObservedValue>())
+                    .saturating_add(key.bytes.capacity())
+                    .saturating_add(observed.original.as_ref().map_or(0, Vec::capacity));
+                if let Change::Insert { key, value } = &observed.change {
+                    bytes = bytes
+                        .saturating_add(key.as_ref().map_or(0, Vec::capacity))
+                        .saturating_add(value.capacity());
+                }
+            }
+        }
+        for (name, definition) in &self.catalog_reads {
+            bytes = bytes
+                .saturating_add(node_bytes::<String, Option<InternalTableDefinition>>())
+                .saturating_add(name.capacity())
+                .saturating_add(definition_bytes(definition.as_ref()));
+        }
+        bytes
+    }
+
+    fn validate_for_batch(
+        &self,
+        latest: &ReadTransaction,
+        history: &CommitHistory,
+    ) -> Result<(), ConcurrentWriteError> {
+        let covered = history.covered(self.snapshot.snapshot_id(), latest.snapshot_id());
+        for (name, expected) in &self.catalog_reads {
+            let current = latest.table_definition(name)?;
+            if current.as_ref().map(schema) != *expected {
+                return Err(conflict(name));
+            }
+            if let Some(state) = self.tables.get(name) {
+                let unchanged_keys = !state.whole_table_read
+                    && current.as_ref() != state.definition.as_ref()
+                    && covered
+                        .as_ref()
+                        .is_some_and(|range| history.keys_unchanged(range.clone(), name, state));
+                (state.validate)(latest, name, state, current.as_ref(), unchanged_keys)?;
+            }
+        }
+        Ok(())
+    }
+
+    // The batch serializes in queue order. Earlier reads may precede later writes;
+    // earlier writes must not invalidate any later point, scan or catalog observation.
+    fn validate_after(&self, earlier: &Self) -> Result<(), ConcurrentWriteError> {
+        for (name, state) in &earlier.tables {
+            if !state.has_writes() || !self.catalog_reads.contains_key(name) {
+                continue;
+            }
+            if state.definition.is_none() {
+                return Err(conflict(name));
+            }
+            let Some(observed) = self.tables.get(name) else {
+                continue;
+            };
+            if observed.whole_table_read {
+                return Err(conflict(name));
+            }
+            for (key, value) in &state.observations {
+                if matches!(value.change, Change::Read) {
+                    continue;
+                }
+                if observed.observations.contains_key(&EncodedKey {
+                    bytes: key.bytes.clone(),
+                    compare: observed.compare,
+                }) {
+                    return Err(conflict(name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_batch(database: &Database, mut requests: Vec<Self>) -> BatchOutcome {
+        if requests.len() == 1 {
+            let request = requests.pop().unwrap();
+            let writes = request.tables.values().any(TableState::has_writes);
+            let result = request.commit_alone(database);
+            if matches!(&result, Err(ConcurrentWriteError::Conflict { .. })) {
+                database.get_memory().metrics_state().record_conflict();
+            }
+            let published = writes && result.is_ok();
+            return BatchOutcome {
+                results: alloc::vec![result],
+                published,
+            };
+        }
+        let mut outcomes: Vec<Option<Result<(), ConcurrentWriteError>>> =
+            (0..requests.len()).map(|_| None).collect();
+        let failed = |outcomes: Vec<Option<Result<(), ConcurrentWriteError>>>,
+                      error: ConcurrentWriteError| {
+            let cause = alloc::sync::Arc::new(error);
+            BatchOutcome {
+                results: outcomes
+                    .into_iter()
+                    .map(|result| {
+                        result.unwrap_or_else(|| {
+                            Err(ConcurrentWriteError::BatchAborted(cause.clone()))
+                        })
+                    })
+                    .collect(),
+                published: false,
+            }
+        };
+        let memory = database.get_memory();
+        let mut writer = match database.begin_write() {
+            Ok(writer) => writer,
+            Err(error) => return failed(outcomes, error.into()),
+        };
+        if let Err(error) = writer.set_durability(Durability::Immediate) {
+            return failed(outcomes, error.into());
+        }
+        let mut history = match database.concurrent_history.lock() {
+            Ok(history) => history,
+            Err(poisoned) => {
+                let mut history = poisoned.into_inner();
+                history.clear();
+                database.concurrent_history.clear_poison();
+                history
+            }
+        };
+        let latest = match database.begin_read() {
+            Ok(latest) => latest,
+            Err(error) => {
+                history.clear();
+                return failed(outcomes, error.into());
+            }
+        };
+        let validation = memory.metrics_state().start(CommitPhase::Validation);
+        let mut accepted = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            let result = request
+                .validate_for_batch(&latest, &history)
+                .and_then(|()| {
+                    for &earlier in &accepted {
+                        request.validate_after(&requests[earlier])?;
+                    }
+                    Ok(())
+                });
+            match result {
+                Ok(()) => accepted.push(index),
+                Err(error @ ConcurrentWriteError::Conflict { .. }) => {
+                    memory.metrics_state().record_conflict();
+                    outcomes[index] = Some(Err(error));
+                }
+                Err(error) => {
+                    history.clear();
+                    return failed(outcomes, error);
+                }
+            }
+        }
+        drop(validation);
+        let previous = latest.snapshot_id();
+        drop(latest);
+        let footprint = Footprint::new(
+            accepted
+                .iter()
+                .flat_map(|&index| requests[index].tables.iter()),
+        );
+        let writes = accepted
+            .iter()
+            .any(|&index| requests[index].tables.values().any(TableState::has_writes));
+        if !writes {
+            if let Err(error) = writer.abort() {
+                history.clear();
+                return failed(outcomes, error.into());
+            }
+        } else {
+            let replay = memory.metrics_state().start(CommitPhase::Replay);
+            for &index in &accepted {
+                for (name, state) in &requests[index].tables {
+                    if let Err(error) = (state.apply)(&writer, name, state) {
+                        history.clear();
+                        return failed(outcomes, error);
+                    }
+                }
+            }
+            drop(replay);
+            drop(requests);
+            let (committed, committed_writer) = match writer.commit_and_hold() {
+                Ok(result) => result,
+                Err(error) => {
+                    history.clear();
+                    return failed(outcomes, error.into());
+                }
+            };
+            // Only accepted writes enter this one physical epoch's bounded footprint.
+            history.record(previous, committed, footprint);
+            drop(history);
+            drop(committed_writer);
+        }
+        for index in accepted {
+            outcomes[index] = Some(Ok(()));
+        }
+        BatchOutcome {
+            results: outcomes.into_iter().map(Option::unwrap).collect(),
+            published: writes,
+        }
+    }
 }
 
 /// A scoped, typed view of a concurrent transaction's private table changes.

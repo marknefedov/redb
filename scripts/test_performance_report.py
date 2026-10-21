@@ -46,6 +46,47 @@ def concurrent_fixture():
                 for writers in (1, 2, 4) for api in report.APIS]}
 
 
+def grouped_fixture():
+    data = {"schema": 2, "transactions_per_writer": 1024, "preparation_reads": 64, "reference_keys": 1024,
+            "value_bytes": 150, "max_retries": 16384, "modes": list(report.MODES), "writers": [1, 2, 4, 8, 16],
+            "group_commit": dict(zip(report.GROUP_LIMITS, (16, 1048576, 64, 4194304))), "results": []}
+    for mode in report.MODES:
+        for workload in report.WRITER_WORKLOADS:
+            for writers in data["writers"]:
+                for api in report.GROUP_APIS:
+                    total = 1024 * writers
+                    conflicts = 0 if api == "classic" else 5
+                    rejections = 3 if api == "grouped" else 0
+                    stats = None if api != "grouped" else {
+                        "queued_transactions": 0, "queued_bytes": 0, "active_transactions": 0, "active_bytes": 0,
+                        "max_queued_transactions": writers, "max_queued_bytes": writers * 1024,
+                        "physical_batches": 1024, "committed_transactions": total,
+                        "max_batch_transactions": writers, "max_batch_bytes": writers * 1024}
+                    row = {"mode": mode, "api": api, "workload": workload, "writers": writers,
+                           "transactions": total, "attempts": total + conflicts + rejections,
+                           "conflicts": conflicts, "queue_rejections": rejections, "retries": conflicts + rejections,
+                           "elapsed_ns": total * 1_000_000, "transactions_per_second": 1000,
+                           "backend_bytes": 65536, "group_stats": stats,
+                           "latency_ns": {"p50": 1000, "p99": 2000, "p999": 3000, "max": 4000}}
+                    diagnostic = {name: copy.deepcopy(value) for name, value in row.items()
+                                  if name not in ("mode", "api", "workload", "writers")}
+                    diagnostic["elapsed_ns"] *= 2
+                    diagnostic["transactions_per_second"] = 500
+                    metrics = {name: {"calls": total, "total_ns": total * 1000, "max_ns": 2000}
+                               for name in report.METRIC_PHASES}
+                    metrics.update(dict.fromkeys(report.METRIC_COUNTERS, 0))
+                    metrics.update({"enabled": True, "physical_commits": 1024 if stats else total,
+                                    "durable_commits": 1024 if stats else total, "written_bytes": 65536,
+                                    "conflicts": conflicts, "queue_rejections": rejections})
+                    if stats:
+                        metrics.update({"group_batches": stats["physical_batches"], "grouped_transactions": total,
+                                        "max_group_size": stats["max_batch_transactions"]})
+                    diagnostic["commit_metrics"] = metrics
+                    row["diagnostics"] = diagnostic
+                    data["results"].append(row)
+    return data
+
+
 class PerformanceReportTests(unittest.TestCase):
     def test_compares_counterbalanced_runs_and_publishes_worst_tails(self):
         data = fixture()
@@ -127,6 +168,43 @@ class PerformanceReportTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 report.render(data)
 
+    def test_grouped_writer_report_separates_primary_and_diagnostic_measurements(self):
+        data = fixture()
+        data["concurrent"] = grouped_fixture()
+        markdown = report.render(data)
+        self.assertIn("grouped | 1,000 | 1.000x | 5 / 3 / 1,032", markdown)
+        self.assertIn("Separate instrumented run: I/O and grouping", markdown)
+        self.assertIn("Separate instrumented run: phase mean / max us", markdown)
+        self.assertIn("grouped | 500 | 1,024", markdown)
+        self.assertIn("Primary throughput and latency use metrics disabled", markdown)
+        self.assertIn("Do not add phase times", markdown)
+        self.assertLess(len(markdown.encode()), 60000)
+        self.assertLess(len(json.dumps(data, indent=2).encode()), report.MAX_BYTES)
+
+    def test_rejects_bad_group_limits_stats_and_instrumentation(self):
+        mutations = (
+            lambda d: d["group_commit"].__setitem__("max_batch_bytes", 0),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("active_transactions", 1),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("max_queued_bytes", 4194305),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("max_batch_transactions", 17),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("committed_transactions", 1),
+            lambda d: d["results"][0].__setitem__("group_stats", {}),
+            lambda d: d["results"][-1].__setitem__("attempts", 1),
+            lambda d: d["results"][-1].__setitem__("commit_metrics", {}),
+            lambda d: d["results"][-1]["diagnostics"].__setitem__("transactions_per_second", 1000),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"].__setitem__("enabled", False),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"].__setitem__("written_bytes", True),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"].__setitem__("conflicts", 0),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"]["sync"].__setitem__("max_ns", 2**53),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"]["sync"].__setitem__("calls", 0),
+        )
+        for mutate in mutations:
+            data = fixture()
+            data["concurrent"] = grouped_fixture()
+            mutate(data["concurrent"])
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                report.render(data)
+
 
 @unittest.skipUnless(shutil.which("node"), "Node is needed to check the GitHub comment jobs")
 class CommentWorkflowTests(unittest.TestCase):
@@ -140,7 +218,11 @@ class CommentWorkflowTests(unittest.TestCase):
             artifact = root / "performance-artifact"
             artifact.mkdir()
             (artifact / "performance-results.json").write_text(json.dumps(data))
-            (root / "performance-results.md").write_text(report.render(fixture()))
+            if workflow == "performance-benchmark-comment.yml":
+                # The trusted workflow runs this parser before its posting script.
+                subprocess.run([sys.executable, str(Path(report.__file__)),
+                                str(artifact / "performance-results.json"), "--output", str(root / "performance-results.md")],
+                               text=True, capture_output=True, check=True)
             config = {"existing": existing, "stale": stale, "fork_fallback": fork_fallback}
             harness = """
 const config = CONFIG;
@@ -202,6 +284,51 @@ process.stdout.write(JSON.stringify(calls));
         data["concurrent"]["results"][0]["conflicts"] = 1
         with self.assertRaises(subprocess.CalledProcessError):
             self.execute("performance-benchmark.yml", data=data)
+
+    def test_grouped_comments_publish_primary_and_separate_diagnostics(self):
+        data = fixture()
+        data["concurrent"] = grouped_fixture()
+        for workflow in ("performance-benchmark.yml", "performance-benchmark-comment.yml"):
+            with self.subTest(workflow=workflow):
+                created = self.execute(workflow, data=data)
+                body = created[0]["body"]
+                self.assertIn("Primary throughput and latency use metrics disabled", body)
+                self.assertIn("Separate instrumented run: I/O and grouping", body)
+                self.assertIn("Separate instrumented run: phase mean / max us", body)
+                self.assertIn("grouped | 500 |", body)
+                self.assertLess(len(body.encode()), 60000)
+                self.assertEqual(self.execute(workflow, data=data, stale=True), [])
+
+    def test_grouped_comments_reject_invalid_diagnostics_and_unsafe_values(self):
+        mutations = (
+            lambda d: d["group_commit"].__setitem__("max_batch_bytes", "@everyone"),
+            lambda d: d["results"][-1].__setitem__("api", "[click](https://invalid)"),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("active_bytes", 1),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("max_queued_transactions", 65),
+            lambda d: d["results"][-1]["group_stats"].__setitem__("max_batch_bytes", 1048577),
+            lambda d: d["results"][-1].__setitem__("commit_metrics", {}),
+            lambda d: d["results"][-1].__setitem__("queue_rejections", True),
+            lambda d: d["results"][-1]["diagnostics"].__setitem__("retries", 0),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"].__setitem__("enabled", False),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"].__setitem__("group_batches", 1),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"].__setitem__("sync_errors", 2**53),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"]["sync"].__setitem__("total_ns", float("nan")),
+            lambda d: d["results"][-1]["diagnostics"]["commit_metrics"]["sync"].__setitem__("max_ns", 2**53),
+        )
+        for mutate in mutations:
+            data = fixture()
+            data["concurrent"] = grouped_fixture()
+            mutate(data["concurrent"])
+            for workflow in ("performance-benchmark.yml", "performance-benchmark-comment.yml"):
+                with self.subTest(workflow=workflow, mutation=mutate), self.assertRaises(subprocess.CalledProcessError):
+                    self.execute(workflow, data=data)
+
+    def test_both_comment_paths_reject_oversized_artifacts(self):
+        data = fixture()
+        data["padding"] = " " * report.MAX_BYTES
+        for workflow in ("performance-benchmark.yml", "performance-benchmark-comment.yml"):
+            with self.subTest(workflow=workflow), self.assertRaises(subprocess.CalledProcessError):
+                self.execute(workflow, data=data)
 
     def test_fork_reporter_fallback_update_and_stale_head(self):
         workflow = "performance-benchmark-comment.yml"

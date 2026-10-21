@@ -1793,12 +1793,30 @@ impl WriteTransaction {
     }
 
     fn commit_inner(&mut self, header_lock: Option<&HeaderGuard<'_>>) -> Result<(), CommitError> {
+        #[cfg(not(redb_no_std))]
+        let metrics_memory = self
+            .mem
+            .metrics_state()
+            .is_enabled()
+            .then(|| self.mem.clone());
+        #[cfg(not(redb_no_std))]
+        let timer = metrics_memory.as_ref().and_then(|mem| {
+            mem.metrics_state()
+                .start(crate::commit_metrics::CommitPhase::Commit)
+        });
         // Covers both the error and the panic-unwind path. Without an allocator state,
         // begin_write() refuses new write transactions and the next open repairs.
         let latch = AllocatorStateLatch::arm(self.mem.clone());
         let result = self.commit_inner_helper(header_lock);
         if result.is_ok() {
             latch.disarm();
+        }
+        #[cfg(not(redb_no_std))]
+        if let Some(timer) = timer {
+            timer.complete_commit(
+                result.is_ok(),
+                self.durability == InternalDurability::Immediate,
+            );
         }
         result
     }

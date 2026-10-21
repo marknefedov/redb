@@ -23,7 +23,7 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn has_unset(&self) -> bool {
-        self.get_level(self.get_height() - 1).any_unset()
+        self.get_level(0).any_unset()
     }
 
     pub(crate) fn get(&self, i: u32) -> bool {
@@ -164,9 +164,29 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn resize(&mut self, mut new_len: u32, full: bool) {
+        let mut old_child_len = self.len();
+        let mut new_child_len = new_len;
         for height in self.heights.iter_mut().rev() {
             height.resize(new_len, full);
             new_len = new_len.div_ceil(64);
+        }
+        // Resizing can change a partially populated group's availability without
+        // changing the length of its parent. Repair both boundary summaries.
+        for parent in (0..self.heights.len() - 1).rev() {
+            for group in [
+                old_child_len.saturating_sub(1) / 64,
+                new_child_len.saturating_sub(1) / 64,
+            ] {
+                if group < self.heights[parent].len() {
+                    if self.heights[parent + 1].data[group as usize] == u64::MAX {
+                        self.heights[parent].set(group);
+                    } else {
+                        self.heights[parent].clear(group);
+                    }
+                }
+            }
+            old_child_len = old_child_len.div_ceil(64);
+            new_child_len = new_child_len.div_ceil(64);
         }
         assert!(self.get_level(0).len() <= 64);
     }
@@ -334,24 +354,29 @@ impl U64GroupedBitmap {
 
     pub fn resize(&mut self, new_len: u32, full: bool) {
         if self.data.len() < Self::required_words(new_len) {
-            let default_value = if full { u64::MAX } else { 0 };
-            self.data
-                .resize(Self::required_words(new_len), default_value);
+            self.data.resize(Self::required_words(new_len), u64::MAX);
         }
         let old_len = self.len;
         self.len = new_len;
-        if old_len >= new_len {
+        // Bits outside the logical length must remain full, including removed
+        // bits in storage retained for future growth.
+        let (start, end, full) = if new_len >= old_len {
+            (old_len, new_len, full)
+        } else {
+            (new_len, old_len, true)
+        };
+        if start == end {
             return;
         }
-        // Apply `full` to bits [old_len, new_len) one word at a time. For each
+        // Apply `full` to bits [start, end) one word at a time. For each
         // word, build a mask of just the bits in that range that fall within
         // the word, then OR it in (full=true) or AND its complement (full=false).
-        let start_word = old_len / 64;
-        let end_word = (new_len - 1) / 64;
+        let start_word = start / 64;
+        let end_word = (end - 1) / 64;
         for word in start_word..=end_word {
             let word_first_bit = word * 64;
-            let lo = old_len.saturating_sub(word_first_bit);
-            let hi = (new_len - word_first_bit).min(64);
+            let lo = start.saturating_sub(word_first_bit);
+            let hi = (end - word_first_bit).min(64);
             let mask = bits_in_range(lo, hi);
             let slot = &mut self.data[word as usize];
             if full {
@@ -474,6 +499,77 @@ mod test {
         assert_eq!(allocator.find_first_unset().unwrap(), 8);
         allocator.clear(0);
         assert_eq!(allocator.find_first_unset().unwrap(), 0);
+    }
+
+    #[test]
+    fn availability_survives_padding_and_serialization() {
+        for len in [0, 1, 63, 64, 65, 4095, 4096, 4097, 262_145] {
+            let mut bitmap = BtreeBitmap::new_padded(len, len, 16 * 1024 * 1024);
+            assert!(!bitmap.has_unset());
+            assert_eq!(bitmap.alloc(), None);
+            if len > 0 {
+                bitmap.clear(len - 1);
+                assert!(bitmap.has_unset());
+                bitmap = BtreeBitmap::from_bytes(&bitmap.to_vec());
+                assert!(bitmap.has_unset());
+                assert_eq!(bitmap.alloc(), Some(len - 1));
+            }
+            assert!(!bitmap.has_unset());
+            assert_eq!(bitmap.count_unset(), 0);
+            let restored = BtreeBitmap::from_bytes(&bitmap.to_vec());
+            assert!(!restored.has_unset());
+        }
+    }
+
+    #[test]
+    fn resizing_repairs_boundary_summaries_and_excludes_padding() {
+        let mut bitmap = BtreeBitmap::new_padded(0, 0, 16 * 1024 * 1024);
+        let mut reference = vec![];
+        for (len, full) in [
+            (60, true),
+            (65, false),
+            (60, true),
+            (0, true),
+            (65, false),
+            (64, true),
+            (0, false),
+            (4097, false),
+            (4096, true),
+            (4095, true),
+            (0, true),
+            (8193, true),
+            (8194, false),
+            (8193, true),
+            (64, true),
+            (0, true),
+        ] {
+            bitmap.resize(len, full);
+            reference.resize(len as usize, full);
+            for serialized in [false, true] {
+                if serialized {
+                    bitmap = BtreeBitmap::from_bytes(&bitmap.to_vec());
+                }
+                assert_eq!(bitmap.len() as usize, reference.len());
+                assert_eq!(
+                    bitmap.count_unset() as usize,
+                    reference.iter().filter(|&&allocated| !allocated).count()
+                );
+                assert_eq!(
+                    bitmap.has_unset(),
+                    reference.iter().any(|&allocated| !allocated)
+                );
+                assert_eq!(
+                    bitmap.find_first_unset(),
+                    reference
+                        .iter()
+                        .position(|&allocated| !allocated)
+                        .map(|index| u32::try_from(index).unwrap())
+                );
+                for (index, &allocated) in reference.iter().enumerate() {
+                    assert_eq!(bitmap.get(u32::try_from(index).unwrap()), allocated);
+                }
+            }
+        }
     }
 
     #[test]

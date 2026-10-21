@@ -5,8 +5,10 @@
 redb is a simple, portable, high-performance, ACID, embedded key-value store.
 
 Each redb database contains a collection of tables, and supports a single writer and multiple
-concurrent readers. redb uses MVCC to provide isolation, and provides a single isolation level:
-serializable, in which all writes are applied sequentially.
+concurrent readers. redb uses MVCC to provide serializable isolation. Physical writes and commits
+are applied sequentially. [Optimistic write transactions](concurrent-writes.md) can prepare
+changes concurrently against pinned snapshots, then validate their read dependencies before
+applying and publishing those changes through the ordinary writer.
 
 Each table is a key-value mapping providing an interface similar to `BTreeMap`.
 

@@ -1,6 +1,9 @@
 # redb - Changelog
 
 ## 5.0.0 - 2026-XX-XX
+* Add optimistic write transactions through `Database::begin_concurrent_write()`. Writers can
+  prepare changes concurrently; commit validates read dependencies and reports conflicts for retry.
+* Improve allocation availability checks and add repeatable throughput and tail-latency benchmarks.
 * This fork creates format v4 databases with 256-byte allocation units and exact contiguous
   extents for ordinary tree nodes. Writes reuse gaps and move a bounded number of neighboring
   nodes toward lower offsets. Hysteresis controls reclamation and file resizing, and durable

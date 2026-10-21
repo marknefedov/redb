@@ -70,6 +70,10 @@
 // std builds.
 extern crate alloc;
 
+pub use concurrent::{
+    ConcurrentRange, ConcurrentTable, ConcurrentValue, ConcurrentWriteError,
+    ConcurrentWriteTransaction,
+};
 #[cfg(feature = "experimental-multiprocess")]
 pub use db::ConcurrencyMode;
 #[cfg(not(redb_no_std))]
@@ -104,6 +108,7 @@ pub type Result<T = (), E = StorageError> = core::result::Result<T, E>;
 
 pub mod backends;
 mod complex_types;
+mod concurrent;
 mod db;
 mod error;
 // Public under the redb 5 API preview, so a backend author can name the error type in both

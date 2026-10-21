@@ -25,6 +25,7 @@ tempfile = "3.5.0"
 libc = "0.2.99"
 ctrlc = "3.2.3"
 env_logger = "0.11"
+serde_json = "1"
 
 [[bench]]
 name = "atomics_benchmark"
@@ -44,5 +45,13 @@ harness = false
 
 [[bench]]
 name = "redb_benchmark"
+harness = false
+
+[[bench]]
+name = "performance_benchmark"
+harness = false
+
+[[bench]]
+name = "concurrent_write_benchmark"
 harness = false
 

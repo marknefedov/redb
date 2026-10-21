@@ -724,8 +724,10 @@ impl ReadOnlyDatabase {
 /// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
 /// Use [`Self::begin_write`] to get a [`WriteTransaction`] object that can be used to read or write to the database
 ///
-/// Multiple reads may be performed concurrently, with each other, and with writes. Only a single write
-/// may be in progress at a time.
+/// Multiple reads may be performed concurrently, with each other, and with writes.
+/// [`Self::begin_write`] serializes write transactions. [`Self::begin_concurrent_write`]
+/// allows optimistic write transactions to prepare concurrently and validates their
+/// dependencies before publishing changes.
 ///
 /// # Close semantics
 ///
@@ -766,6 +768,7 @@ impl ReadOnlyDatabase {
 pub struct Database {
     mem: Arc<TransactionalMemory>,
     transaction_tracker: Arc<TransactionTracker>,
+    pub(crate) concurrent_history: crate::sync::Mutex<crate::concurrent::CommitHistory>,
 }
 
 impl Sealed for Database {}
@@ -1646,6 +1649,7 @@ impl Database {
         Ok(Database {
             mem,
             transaction_tracker,
+            concurrent_history: crate::sync::Mutex::new(crate::concurrent::CommitHistory::default()),
         })
     }
 
@@ -1707,6 +1711,23 @@ impl Database {
     /// transaction remains usable and the database closes when the transaction completes.
     pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
         self.begin_write_with(None, None)
+    }
+
+    /// Begins an optimistic write transaction without taking the writer lock.
+    ///
+    /// Transactions read a stable snapshot and buffer their changes independently.
+    /// At commit, read dependencies are validated and changes are applied under the
+    /// writer lock. Disjoint keys may commit concurrently prepared changes; a
+    /// conflicting transaction returns [`crate::ConcurrentWriteError::Conflict`]
+    /// and must be retried from a new snapshot.
+    ///
+    /// This API supports ordinary tables within one process. Savepoints and
+    /// multimap tables remain available through [`Self::begin_write`]. Unlike
+    /// [`Self::begin_write`], the returned transaction borrows this database.
+    pub fn begin_concurrent_write(
+        &self,
+    ) -> Result<crate::ConcurrentWriteTransaction<'_>, TransactionError> {
+        crate::ConcurrentWriteTransaction::new(self)
     }
 
     fn begin_write_with(

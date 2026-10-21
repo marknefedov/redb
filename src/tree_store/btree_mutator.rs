@@ -1494,14 +1494,24 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         accessor: &BranchAccessor<'_, T>,
         modified_child: usize,
     ) -> Result<Option<(usize, PageNumber, Checksum)>> {
-        if !self.page_allocator.can_evacuate() {
+        if !self.page_allocator.begin_evacuation_scan() {
             return Ok(None);
         }
-        let candidate = (0..accessor.count_children())
-            .filter(|&index| index != modified_child)
-            .map(|index| (index, accessor.child_page(index).unwrap()))
-            .filter(|&(_, page)| !self.page_allocator.uncommitted(page))
-            .max_by_key(|&(_, page)| page);
+        let mut candidate = None;
+        for index in 0..accessor.count_children() {
+            if index == modified_child {
+                continue;
+            }
+            let page = accessor.child_page(index).unwrap();
+            if candidate.is_some_and(|(_, best)| page < best)
+                || accessor.child_checksum(index).unwrap() == DEFERRED
+            {
+                continue;
+            }
+            if !self.page_allocator.uncommitted(page) {
+                candidate = Some((index, page));
+            }
+        }
         let Some((index, page_number)) = candidate else {
             return Ok(None);
         };

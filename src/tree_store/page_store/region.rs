@@ -1,3 +1,4 @@
+use super::extent_index::ExtentIndex;
 use crate::tree_store::page_store::base::MAX_REGIONS;
 use crate::tree_store::page_store::bitmap::BtreeBitmap;
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
@@ -12,6 +13,7 @@ use core::mem::size_of;
 // a region may not actually have a page free for a given order
 pub(crate) struct RegionTracker {
     order_trackers: Vec<BtreeBitmap>,
+    run_index: ExtentIndex,
 }
 
 impl RegionTracker {
@@ -22,6 +24,7 @@ impl RegionTracker {
         }
         Self {
             order_trackers: data,
+            run_index: ExtentIndex::default(),
         }
     }
 
@@ -68,11 +71,47 @@ impl RegionTracker {
 
         Self {
             order_trackers: data,
+            run_index: ExtentIndex::default(),
         }
     }
 
     pub(crate) fn find_free(&self, order: u8) -> Option<u32> {
         self.order_trackers[order as usize].find_first_unset()
+    }
+
+    pub(crate) fn find_run(&self, pages: u32) -> Option<u32> {
+        self.run_index.first_fit(pages)
+    }
+
+    pub(crate) fn update_run(&mut self, region: u32, largest: u32) {
+        if largest > 0 {
+            self.run_index.insert(region, largest);
+        } else {
+            self.run_index.remove(region);
+        }
+    }
+
+    pub(crate) fn has_reserve_outside(&self, pages: u32, excluded_region: u32) -> bool {
+        match self.run_index.first_fit(pages) {
+            Some(region) if region != excluded_region => true,
+            Some(_) => excluded_region
+                .checked_add(1)
+                .is_some_and(|lower| self.run_index.first_fit_from(pages, lower).is_some()),
+            None => false,
+        }
+    }
+
+    // Exact extents also consume buddy blocks. Keep their availability current so a
+    // subsequent large allocation does not probe every region filled by small writes.
+    pub(crate) fn update_free_order(&mut self, region: u32, highest: Option<u8>) {
+        if let Some(order) = highest {
+            self.mark_free(order, region);
+            if usize::from(order) + 1 < self.order_trackers.len() {
+                self.mark_full(order + 1, region);
+            }
+        } else {
+            self.mark_full(0, region);
+        }
     }
 
     pub(crate) fn mark_free(&mut self, order: u8, region: u32) {
@@ -119,6 +158,7 @@ impl Allocators {
             );
             let max_order = allocator.get_max_order();
             region_tracker.mark_free(max_order, i);
+            region_tracker.update_run(i, allocator.max_run());
             region_allocators.push(allocator);
         }
 
@@ -162,6 +202,7 @@ impl Allocators {
             // Drop all regions that were removed
             for i in new_layout.num_regions()..(self.region_allocators.len().try_into().unwrap()) {
                 self.region_tracker.mark_full(0, i);
+                self.region_tracker.update_run(i, 0);
             }
             self.region_allocators
                 .drain((new_layout.num_regions() as usize)..);
@@ -173,10 +214,18 @@ impl Allocators {
             let allocator = self.region_allocators.last_mut().unwrap();
             if allocator.len() > last_region.num_pages() {
                 allocator.resize(last_region.num_pages());
+                self.region_tracker
+                    .update_run(new_layout.num_regions() - 1, allocator.max_run());
+                self.region_tracker.update_free_order(
+                    new_layout.num_regions() - 1,
+                    allocator.highest_free_order(),
+                );
             }
         } else {
             let old_num_regions = self.region_allocators.len();
-            for i in 0..new_layout.num_regions() {
+            // Growth changes only the old tail and any newly added regions.
+            let first_changed = u32::try_from(old_num_regions.saturating_sub(1)).unwrap();
+            for i in first_changed..new_layout.num_regions() {
                 let new_region = new_layout.region_layout(i);
                 if (i as usize) < old_num_regions {
                     let allocator = &mut self.region_allocators[i as usize];
@@ -185,6 +234,7 @@ impl Allocators {
                         allocator.resize(new_region.num_pages());
                         let highest_free = allocator.highest_free_order().unwrap();
                         self.region_tracker.mark_free(highest_free, i);
+                        self.region_tracker.update_run(i, allocator.max_run());
                     }
                 } else {
                     // brand new region
@@ -197,6 +247,7 @@ impl Allocators {
                         self.region_tracker.resize(i + 1);
                     }
                     self.region_tracker.mark_free(highest_free, i);
+                    self.region_tracker.update_run(i, allocator.max_run());
                     self.region_allocators.push(allocator);
                 }
             }

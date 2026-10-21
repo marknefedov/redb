@@ -1,3 +1,4 @@
+use super::extent_index::ExtentIndex;
 use crate::tree_store::PageNumber;
 use crate::tree_store::page_store::bitmap::BtreeBitmap;
 #[cfg(test)]
@@ -33,6 +34,9 @@ pub(crate) struct BuddyAllocator {
     free: Vec<BtreeBitmap>,
     len: u32,
     max_order: u8,
+    free_pages: u32,
+    evacuating: bool,
+    free_runs: ExtentIndex,
 }
 
 impl BuddyAllocator {
@@ -68,11 +72,16 @@ impl BuddyAllocator {
         }
         assert_eq!(accounted_pages, num_pages);
 
-        Self {
+        let mut result = Self {
             free,
             len: num_pages,
             max_order,
-        }
+            free_pages: num_pages,
+            evacuating: false,
+            free_runs: ExtentIndex::default(),
+        };
+        result.insert_run(0, num_pages);
+        result
     }
 
     pub(crate) fn xxh3_hash(&self) -> u128 {
@@ -138,11 +147,28 @@ impl BuddyAllocator {
             metadata += size_of::<u32>();
         }
 
-        Self {
+        let free_pages = free
+            .iter()
+            .enumerate()
+            .map(|(order, bitmap)| bitmap.count_unset() * (1u32 << order))
+            .sum();
+        let mut result = Self {
             free,
             len: num_pages,
             max_order,
+            free_pages,
+            evacuating: false,
+            free_runs: ExtentIndex::default(),
+        };
+        // The indices are derived, not part of the on-disk allocator format.
+        for order in 0..=max_order {
+            for index in 0..result.free[order as usize].len() {
+                if !result.free[order as usize].get(index) {
+                    result.add_run(index << order, 1 << order);
+                }
+            }
         }
+        result
     }
 
     #[inline]
@@ -157,11 +183,78 @@ impl BuddyAllocator {
     }
 
     pub(crate) fn count_free_pages(&self) -> u32 {
-        let mut pages = 0;
-        for order in 0..=self.max_order {
-            pages += self.get_order_free(order).count_unset() * 2u32.pow(order.into());
+        self.free_pages
+    }
+
+    pub(crate) fn should_evacuate(&mut self) -> bool {
+        // Start at 25% free, stop below 12.5%. This state is only a scheduling hint;
+        // allocator snapshots reconstruct it without affecting correctness.
+        if self.free_pages >= self.len / 4 {
+            self.evacuating = true;
+        } else if self.free_pages < self.len / 8 {
+            self.evacuating = false;
         }
-        pages
+        self.evacuating
+    }
+
+    fn insert_run(&mut self, start: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        assert!(self.free_runs.insert(start, count).is_none());
+    }
+
+    fn remove_run(&mut self, start: u32) -> u32 {
+        self.free_runs.remove(start).unwrap()
+    }
+
+    fn add_run(&mut self, mut start: u32, mut count: u32) {
+        if let Some((before, len)) = self.free_runs.floor(start) {
+            assert!(before + len <= start);
+            if before + len == start {
+                self.remove_run(before);
+                start = before;
+                count += len;
+            }
+        }
+        if let Some((after, len)) = self.free_runs.ceiling(start) {
+            assert!(start + count <= after);
+            if start + count == after {
+                self.remove_run(after);
+                count += len;
+            }
+        }
+        self.insert_run(start, count);
+    }
+
+    fn take_run(&mut self, start: u32, count: u32) {
+        let (before, len) = self.free_runs.floor(start).unwrap();
+        assert!(before <= start && start + count <= before + len);
+        self.remove_run(before);
+        self.insert_run(before, start - before);
+        self.insert_run(start + count, before + len - start - count);
+    }
+
+    // The augmented address index finds the lowest fit without scanning holes.
+    pub(crate) fn alloc_run(&mut self, count: u32) -> Option<u32> {
+        assert!(count > 0);
+        let start = self.free_runs.first_fit(count)?;
+        let mut remaining = count;
+        let mut offset = start;
+        while remaining > 0 {
+            let order = u8::try_from(offset.trailing_zeros().min(remaining.ilog2())).unwrap();
+            assert!(self.record_alloc_inner(offset >> order, order));
+            let len = 1 << order;
+            offset += len;
+            remaining -= len;
+        }
+        self.take_run(start, count);
+        self.free_pages -= count;
+        Some(start)
+    }
+
+    pub(crate) fn max_run(&self) -> u32 {
+        self.free_runs.max_len()
     }
 
     pub(crate) fn get_max_order(&self) -> u8 {
@@ -283,6 +376,12 @@ impl BuddyAllocator {
                 pages_for_order = next_higher_order(pages_for_order);
             }
         }
+        if new_size > self.len {
+            self.add_run(self.len, new_size - self.len);
+        } else if new_size < self.len {
+            self.take_run(new_size, self.len - new_size);
+        }
+        self.free_pages = self.free_pages + new_size - self.len;
         self.len = new_size;
         self.debug_check_consistency();
     }
@@ -364,11 +463,16 @@ impl BuddyAllocator {
         }
         assert_eq!(best.0, best_index_at_order);
 
+        self.free_pages -= 1 << order;
+        self.take_run(best.0 << order, 1 << order);
         Some(best.0)
     }
 
     pub(crate) fn alloc(&mut self, order: u8) -> Option<u32> {
-        self.alloc_inner(order)
+        let result = self.alloc_inner(order)?;
+        self.free_pages -= 1 << order;
+        self.take_run(result << order, 1 << order);
+        Some(result)
     }
 
     pub(crate) fn alloc_inner(&mut self, order: u8) -> Option<u32> {
@@ -398,7 +502,12 @@ impl BuddyAllocator {
     #[must_use]
     pub(crate) fn record_alloc(&mut self, page_number: u32, order: u8) -> bool {
         // Split parent pages as necessary, and update the free index
-        self.record_alloc_inner(page_number, order)
+        let result = self.record_alloc_inner(page_number, order);
+        if result {
+            self.free_pages -= 1 << order;
+            self.take_run(page_number << order, 1 << order);
+        }
+        result
     }
 
     #[must_use]
@@ -438,6 +547,8 @@ impl BuddyAllocator {
     ///
     /// Returns the order of the resulting free block, which is `>= order` when buddies merge.
     pub(crate) fn free(&mut self, page_number: u32, order: u8) -> u8 {
+        self.free_pages += 1 << order;
+        self.add_run(page_number << order, 1 << order);
         debug_assert!(self.get_order_free_mut(order).get(page_number));
 
         // Update the free index and merge free pages
@@ -475,7 +586,123 @@ impl BuddyAllocator {
 
 #[cfg(test)]
 mod test {
-    use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
+    use super::BuddyAllocator;
+    use crate::tree_store::PageNumber;
+
+    #[test]
+    fn evacuation_has_separate_start_and_stop_thresholds() {
+        let mut allocator = BuddyAllocator::new(64, 64);
+        let pages: Vec<_> = (0..64).map(|_| allocator.alloc(0).unwrap()).collect();
+        assert!(!allocator.should_evacuate());
+        for &page in &pages[..16] {
+            allocator.free(page, 0);
+        }
+        assert!(allocator.should_evacuate());
+        let reclaimed: Vec<_> = (0..9).map(|_| allocator.alloc(0).unwrap()).collect();
+        assert!(!allocator.should_evacuate());
+        allocator.free(reclaimed[0], 0);
+        assert!(!allocator.should_evacuate());
+        for &page in &reclaimed[1..] {
+            allocator.free(page, 0);
+        }
+        assert!(allocator.should_evacuate());
+    }
+
+    #[test]
+    fn exact_runs_cross_buddy_boundaries() {
+        let mut allocator = BuddyAllocator::new(32, 32);
+        for _ in 0..32 {
+            allocator.alloc(0).unwrap();
+        }
+        for page in 3..11 {
+            allocator.free(page, 0);
+        }
+        assert!(allocator.alloc(3).is_none());
+        assert_eq!(allocator.alloc_run(8), Some(3));
+        assert_eq!(allocator.count_free_pages(), 0);
+        let mut page = PageNumber::new(0, 3, 0);
+        page.used_pages = 8;
+        for block in page.blocks() {
+            allocator.free(block.page_index, block.page_order);
+        }
+        let mut restored = BuddyAllocator::from_bytes(&allocator.to_vec());
+        assert_eq!(restored.alloc_run(8), Some(3));
+    }
+
+    #[test]
+    fn large_exact_runs_use_lowest_fit_and_survive_reload() {
+        let mut allocator = BuddyAllocator::new(256, 256);
+        for _ in 0..256 {
+            allocator.alloc(0).unwrap();
+        }
+        for page in (17..52).chain(91..144) {
+            allocator.free(page, 0);
+        }
+        assert_eq!(allocator.alloc_run(33), Some(17));
+        assert_eq!(allocator.alloc_run(40), Some(91));
+        assert_eq!(allocator.count_free_pages(), 15);
+        let mut allocator = BuddyAllocator::from_bytes(&allocator.to_vec());
+        assert_eq!(allocator.max_run(), 13);
+        assert_eq!(allocator.alloc_run(13), Some(131));
+        let mut page = PageNumber::new(0, 17, 0);
+        page.used_pages = 33;
+        for block in page.blocks() {
+            allocator.free(block.page_index, block.page_order);
+        }
+        assert_eq!(allocator.alloc_run(34), Some(17));
+    }
+
+    #[test]
+    fn exact_runs_match_a_bitmap_through_reuse_resize_and_reload() {
+        let mut allocator = BuddyAllocator::new(256, 512);
+        let mut used = vec![false; 256];
+        let mut live = vec![];
+        let mut state = 7u64;
+        for step in 0..2000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if live.is_empty() || !state.is_multiple_of(3) {
+                let count = usize::try_from(state % 127).unwrap() + 1;
+                let expected = used
+                    .windows(count)
+                    .position(|window| window.iter().all(|v| !v));
+                let actual = allocator.alloc_run(u32::try_from(count).unwrap());
+                assert_eq!(actual.map(|v| v as usize), expected);
+                if let Some(start) = expected {
+                    used[start..start + count].fill(true);
+                    live.push((start, count));
+                }
+            } else {
+                let (start, count) = live.swap_remove(
+                    usize::try_from(state % u64::try_from(live.len()).unwrap()).unwrap(),
+                );
+                let mut page = PageNumber::new(0, u32::try_from(start).unwrap(), 0);
+                page.used_pages = u16::try_from(count).unwrap();
+                for block in page.blocks() {
+                    allocator.free(block.page_index, block.page_order);
+                }
+                used[start..start + count].fill(false);
+            }
+            assert_eq!(
+                allocator.count_free_pages() as usize,
+                used.iter().filter(|v| !**v).count()
+            );
+            if step % 73 == 0 {
+                allocator = BuddyAllocator::from_bytes(&allocator.to_vec());
+            }
+        }
+        allocator.resize(512);
+        assert_eq!(
+            allocator.count_free_pages() as usize,
+            512 - used.iter().filter(|v| **v).count()
+        );
+        allocator.resize(256);
+        assert_eq!(
+            allocator.count_free_pages() as usize,
+            used.iter().filter(|v| !**v).count()
+        );
+    }
 
     #[test]
     fn record_alloc_buddy() {

@@ -16,33 +16,31 @@ use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 pub(crate) const MAX_VALUE_LENGTH: usize = 3 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PAIR_LENGTH: usize = 3 * 1024 * 1024 * 1024 + 768 * 1024 * 1024;
-pub(crate) const MAX_PAGE_INDEX: u32 = 0x000F_FFFF;
+pub(crate) const MAX_PAGE_INDEX: u32 = 0x00FF_FFFF;
 pub(crate) const MAX_REGIONS: u32 = 0x0010_0000;
 
-// On-disk format is:
-// TODO: consider implementing an optimization in which we store the number of order-0 pages that
-// are actually used, in these reserved bits, so that the reads to the PagedCachedFile layer can avoid
-// reading all the zeros at the end of the page.
-// lowest 20bits: page index within the region. Only the lowest `20 - order_exponent` bits may be read.
-// The remaining bits are reserved for future use and must be ignored
-// second 20bits: region number
-// 19bits: reserved
-// highest 5bits: page order exponent
+// v4 extends the v3 address using formerly reserved bits:
+// bits 40..44: high four page-index bits
+// bits 44..59: extent length in base pages; zero means a legacy buddy block.
+// With a nonzero length the index is an absolute base-page index and the order is zero.
+// v3 pointers have zeroes in these fields and retain their original meaning.
+// bits 0..20: low twenty page-index bits
+// bits 20..40: region number
+// bits 59..64: page order exponent
+// A buddy pointer masks the combined index to 24 - order bits and scales by 2^order.
 //
-// Assuming a reasonable page size, like 4kiB, this allows for 4kiB * 2^20 * 2^20 = 4PiB of usable space
+// 256-byte units * 2^24 pages * 2^20 regions address 4 PiB of usable space.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) struct PageNumber {
     pub(crate) region: u32,
     pub(crate) page_index: u32,
     pub(crate) page_order: u8,
+    pub(crate) used_pages: u16,
 }
 
 impl Hash for PageNumber {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut temp = 0x000F_FFFF & u64::from(self.page_index);
-        temp |= (0x000F_FFFF & u64::from(self.region)) << 20;
-        temp |= (0b0001_1111 & u64::from(self.page_order)) << 59;
-        state.write_u64(temp);
+        state.write_u64(u64::from_le_bytes(self.to_le_bytes()));
     }
 }
 
@@ -52,10 +50,10 @@ impl Ord for PageNumber {
         match self.region.cmp(&other.region) {
             Ordering::Less => Ordering::Less,
             Ordering::Equal => {
-                let self_order0 = self.page_index * 2u32.pow(self.page_order.into());
-                let other_order0 = other.page_index * 2u32.pow(other.page_order.into());
+                let self_order0 = self.start_page();
+                let other_order0 = other.start_page();
                 assert!(
-                    self_order0 != other_order0 || self.page_order == other.page_order,
+                    self_order0 != other_order0 || self == other,
                     "{self:?} overlaps {other:?}, but is not equal"
                 );
                 self_order0.cmp(&other_order0)
@@ -84,6 +82,7 @@ impl PageNumber {
             region,
             page_index,
             page_order,
+            used_pages: 0,
         }
     }
 
@@ -91,25 +90,63 @@ impl PageNumber {
         let mut temp = 0x000F_FFFF & u64::from(self.page_index);
         temp |= (0x000F_FFFF & u64::from(self.region)) << 20;
         temp |= (0b0001_1111 & u64::from(self.page_order)) << 59;
+        temp |= u64::from(self.page_index >> 20) << 40;
+        temp |= u64::from(self.used_pages) << 44;
         temp.to_le_bytes()
     }
 
     pub(crate) fn from_le_bytes(bytes: [u8; 8]) -> Self {
         let temp = u64::from_le_bytes(bytes);
         let order = (temp >> 59) as u8;
-        let index = u32::try_from(temp & (0x000F_FFFF >> order)).unwrap();
+        let used_pages = ((temp >> 44) & 0x7FFF) as u16;
+        let index = ((temp & 0x000F_FFFF) as u32 | (((temp >> 40) & 15) as u32) << 20)
+            & (MAX_PAGE_INDEX >> if used_pages == 0 { order } else { 0 });
         let region = ((temp >> 20) & 0x000F_FFFF) as u32;
 
         Self {
             region,
             page_index: index,
             page_order: order,
+            used_pages,
         }
+    }
+
+    pub(crate) fn base_pages(self) -> u32 {
+        if self.used_pages == 0 {
+            1 << self.page_order
+        } else {
+            u32::from(self.used_pages)
+        }
+    }
+
+    pub(crate) fn start_page(self) -> u32 {
+        if self.used_pages == 0 {
+            self.page_index << self.page_order
+        } else {
+            self.page_index
+        }
+    }
+
+    // Decompose an unaligned extent into at most 2 * MAX_MAX_PAGE_ORDER buddy blocks.
+    pub(crate) fn blocks(self) -> impl Iterator<Item = Self> {
+        let mut start = self.start_page();
+        let mut remaining = self.base_pages();
+        core::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            let order = u8::try_from(start.trailing_zeros().min(remaining.ilog2())).unwrap();
+            let result = Self::new(self.region, start >> order, order);
+            let count = 1 << order;
+            start += count;
+            remaining -= count;
+            Some(result)
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn to_order0(self) -> Vec<PageNumber> {
-        let mut pages = vec![self];
+        let mut pages: Vec<_> = self.blocks().collect();
         loop {
             let mut progress = false;
             let mut new_pages = vec![];
@@ -147,7 +184,7 @@ impl PageNumber {
         page_size: u32,
     ) -> Range<u64> {
         let regional_start =
-            region_pages_start + u64::from(self.page_index) * self.page_size_bytes(page_size);
+            region_pages_start + u64::from(self.start_page()) * u64::from(page_size);
         debug_assert!(regional_start < region_size);
         let region_base = u64::from(self.region) * region_size;
         let start = data_section_offset + region_base + regional_start;
@@ -156,8 +193,7 @@ impl PageNumber {
     }
 
     pub(crate) fn page_size_bytes(&self, page_size: u32) -> u64 {
-        let pages = 1u64 << self.page_order;
-        pages * u64::from(page_size)
+        u64::from(self.base_pages()) * u64::from(page_size)
     }
 }
 
@@ -165,8 +201,8 @@ impl Debug for PageNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "r{}.{}/{}",
-            self.region, self.page_index, self.page_order
+            "r{}.{}/{}+{}",
+            self.region, self.page_index, self.page_order, self.used_pages
         )
     }
 }
@@ -440,6 +476,21 @@ mod test {
     use crate::tree_store::PageNumber;
 
     #[test]
+    fn extent_addresses_round_trip_without_alignment_padding() {
+        let mut page = PageNumber::new(19, 0x00FF_FFE0, 0);
+        page.used_pages = 13;
+        assert_eq!(PageNumber::from_le_bytes(page.to_le_bytes()), page);
+        let range = page.address_range(512, 1u64 << 32, 0, 256);
+        assert_eq!(range.start, 512 + 19 * (1u64 << 32) + 0x00FF_FFE0 * 256);
+        assert_eq!(range.end - range.start, 13 * 256);
+        assert_eq!(
+            page.blocks().map(|block| block.base_pages()).sum::<u32>(),
+            13
+        );
+        assert!(page.blocks().count() <= 2 * 24);
+    }
+
+    #[test]
     fn last_page() {
         let region_data_size = 2u64.pow(32);
         let page_size = 4096;
@@ -459,7 +510,7 @@ mod test {
     fn reserved_bits() {
         let page_number = PageNumber::new(0, 0, 12);
         let mut bytes = page_number.to_le_bytes();
-        bytes[1] = 0xFF;
+        bytes[1] = 0xF0;
         let page_number2 = PageNumber::from_le_bytes(bytes);
         assert_eq!(page_number, page_number2);
     }

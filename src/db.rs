@@ -2341,6 +2341,7 @@ mod test {
 
         // Fails the fourth write of the second commit below; the create makes three
         let backend = FailingBackend::new(FileBackend::new(file).unwrap(), 17);
+        let countdown = backend.countdown.clone();
         let db = Database::builder()
             .set_cache_size(12686)
             .set_page_size(8 * 1024)
@@ -2359,6 +2360,8 @@ mod test {
             let mut table = tx.open_table(table_def).unwrap();
             let _ = table.insert_reserve(118821, 360).unwrap();
         }
+        // Force the next backend write to fail independently of allocation geometry.
+        countdown.store(0, Ordering::SeqCst);
         let result = tx.commit();
         assert!(result.is_err());
 

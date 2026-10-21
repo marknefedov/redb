@@ -23,8 +23,9 @@ use std::time::Duration;
 
 const ELEMENTS: usize = 100;
 const PAGE_REUSE_VALUE_LEN: usize = 512 * 1024;
-const MIN_REUSED_VALUE_PAGES: u64 = 64;
-const MAX_PAGE_REUSE_METADATA_GROWTH: u64 = 16;
+// Keep the original KiB bounds independent of the format's allocation unit.
+const MIN_REUSED_VALUE_BYTES: u64 = 64 * 4096;
+const MAX_PAGE_REUSE_METADATA_BYTES: u64 = 16 * 4096;
 
 const SLICE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slice");
 const SLICE_TABLE2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slice2");
@@ -1101,13 +1102,14 @@ fn corrupted_persistent_savepoint_record() {
         id
     };
 
-    // Find the serialized savepoint record: version 3, the savepoint id, a plausible
+    // Find the serialized savepoint record: current format, savepoint id, a plausible
     // transaction id, and a non-null user root
     let mut data = fs::read(path).unwrap();
+    let version = data[64 + usize::from(data[9] & 1) * 128];
     let mut offsets = vec![];
     for i in 0..data.len() - 18 {
         let transaction_id = u64::from_le_bytes(data[i + 9..i + 17].try_into().unwrap());
-        if data[i] == 3
+        if data[i] == version
             && u64::from_le_bytes(data[i + 1..i + 9].try_into().unwrap()) == savepoint_id
             && transaction_id > 0
             && transaction_id < 100
@@ -1155,6 +1157,11 @@ fn begin_page_reuse_write(db: &Database, quick_repair: bool) -> WriteTransaction
     txn
 }
 
+fn allocated_bytes(txn: &WriteTransaction) -> u64 {
+    let stats = txn.stats().unwrap();
+    stats.allocated_pages() * u64::try_from(stats.page_size()).unwrap()
+}
+
 fn make_page_reuse_value(byte: u8) -> Vec<u8> {
     vec![byte; PAGE_REUSE_VALUE_LEN]
 }
@@ -1186,7 +1193,7 @@ fn test_page_reuse(quick_repair: bool) {
 
     // Should reuse the page for 0 -> 0
     let txn = begin_page_reuse_write(&db, quick_repair);
-    let allocated_pages = txn.stats().unwrap().allocated_pages();
+    let allocated_pages = allocated_bytes(&txn);
     {
         let mut table = txn.open_table(U64_TABLE).unwrap();
         table.insert(0, 2).unwrap();
@@ -1198,9 +1205,9 @@ fn test_page_reuse(quick_repair: bool) {
     txn.commit().unwrap();
 
     let txn = begin_page_reuse_write(&db, quick_repair);
-    let allocated_after_reuse = txn.stats().unwrap().allocated_pages();
+    let allocated_after_reuse = allocated_bytes(&txn);
     assert!(
-        allocated_after_reuse <= allocated_pages + MAX_PAGE_REUSE_METADATA_GROWTH,
+        allocated_after_reuse <= allocated_pages + MAX_PAGE_REUSE_METADATA_BYTES,
         "allocated_pages={allocated_pages}, allocated_after_reuse={allocated_after_reuse}, quick_repair={quick_repair}"
     );
 }
@@ -1224,7 +1231,7 @@ fn test_page_reuse_after_persistent_savepoint_delete(quick_repair: bool) {
     txn.commit().unwrap();
 
     let txn = begin_page_reuse_write(&db, quick_repair);
-    let allocated_with_savepoint = txn.stats().unwrap().allocated_pages();
+    let allocated_with_savepoint = allocated_bytes(&txn);
     txn.abort().unwrap();
 
     let txn = begin_page_reuse_write(&db, quick_repair);
@@ -1235,7 +1242,7 @@ fn test_page_reuse_after_persistent_savepoint_delete(quick_repair: bool) {
     txn.commit().unwrap();
 
     let txn = begin_page_reuse_write(&db, quick_repair);
-    let allocated_pinned = txn.stats().unwrap().allocated_pages();
+    let allocated_pinned = allocated_bytes(&txn);
     assert!(
         allocated_pinned >= allocated_with_savepoint,
         "allocated_with_savepoint={allocated_with_savepoint}, allocated_pinned={allocated_pinned}, quick_repair={quick_repair}"
@@ -1247,9 +1254,9 @@ fn test_page_reuse_after_persistent_savepoint_delete(quick_repair: bool) {
     txn.commit().unwrap();
 
     let txn = begin_page_reuse_write(&db, quick_repair);
-    let allocated_after_delete = txn.stats().unwrap().allocated_pages();
+    let allocated_after_delete = allocated_bytes(&txn);
     assert!(
-        allocated_with_savepoint > allocated_after_delete + MIN_REUSED_VALUE_PAGES,
+        allocated_with_savepoint > allocated_after_delete + MIN_REUSED_VALUE_BYTES,
         "allocated_with_savepoint={allocated_with_savepoint}, allocated_after_delete={allocated_after_delete}, quick_repair={quick_repair}"
     );
     txn.abort().unwrap();
@@ -1263,9 +1270,9 @@ fn test_page_reuse_after_persistent_savepoint_delete(quick_repair: bool) {
     txn.commit().unwrap();
 
     let txn = begin_page_reuse_write(&db, quick_repair);
-    let allocated_after_reinsert = txn.stats().unwrap().allocated_pages();
+    let allocated_after_reinsert = allocated_bytes(&txn);
     assert!(
-        allocated_after_reinsert <= allocated_with_savepoint + MAX_PAGE_REUSE_METADATA_GROWTH,
+        allocated_after_reinsert <= allocated_with_savepoint + MAX_PAGE_REUSE_METADATA_BYTES,
         "allocated_with_savepoint={allocated_with_savepoint}, allocated_after_reinsert={allocated_after_reinsert}, quick_repair={quick_repair}"
     );
     txn.abort().unwrap();
@@ -2811,7 +2818,7 @@ fn regression22() {
     txn.commit().unwrap();
 
     let txn = db.begin_write().unwrap();
-    let allocated_pages = txn.stats().unwrap().allocated_pages();
+    let allocated_pages = allocated_bytes(&txn);
     {
         let mut table = txn.open_table(U64_TABLE).unwrap();
         table.insert(0, 0).unwrap();
@@ -2834,9 +2841,9 @@ fn regression22() {
     drop(read_txn);
 
     let txn = db.begin_write().unwrap();
-    let after = txn.stats().unwrap().allocated_pages();
+    let after = allocated_bytes(&txn);
     assert!(
-        after <= allocated_pages + MAX_PAGE_REUSE_METADATA_GROWTH,
+        after <= allocated_pages + MAX_PAGE_REUSE_METADATA_BYTES,
         "allocated_pages={allocated_pages}, after={after}"
     );
 }

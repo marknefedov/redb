@@ -64,6 +64,10 @@ the host. Cargo build artifacts are cached in the `redb-sandbox-target` Podman
 volume; remove that volume to force a clean sandbox build.
 
 ## Benchmarks
+This fork's space and latency benchmark runs without redb compaction and publishes results on
+pull requests. Run `just bench_space`; see [work bounds, format, and migration](docs/space.md).
+The comparison below contains historical upstream measurements.
+
 redb has similar performance to other top embedded key-value stores such as lmdb and rocksdb
 
 |                           | redb      | lmdb       | rocksdb        | fjall       | sqlite     |

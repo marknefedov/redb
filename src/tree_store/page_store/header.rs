@@ -3,7 +3,8 @@ use crate::tree_store::btree_base::{BtreeHeader, Checksum};
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, MAX_REGIONS};
 use crate::tree_store::page_store::layout::{DatabaseLayout, RegionLayout};
 use crate::tree_store::page_store::page_manager::{
-    FILE_FORMAT_VERSION1, FILE_FORMAT_VERSION2, FILE_FORMAT_VERSION3, xxh3_checksum,
+    FILE_FORMAT_VERSION1, FILE_FORMAT_VERSION2, FILE_FORMAT_VERSION3, FILE_FORMAT_VERSION4,
+    xxh3_checksum,
 };
 use crate::{DatabaseError, Result, StorageError};
 use alloc::format;
@@ -51,7 +52,7 @@ const REGION_MAX_DATA_PAGES_OFFSET: usize = REGION_HEADER_PAGES_OFFSET + size_of
 const NUM_FULL_REGIONS_OFFSET: usize = REGION_MAX_DATA_PAGES_OFFSET + size_of::<u32>();
 const TRAILING_REGION_DATA_PAGES_OFFSET: usize = NUM_FULL_REGIONS_OFFSET + size_of::<u32>();
 // Formerly the region tracker page
-const _UNUSED3_OFFSET: usize = TRAILING_REGION_DATA_PAGES_OFFSET + size_of::<u32>();
+const NODE_SIZE_OFFSET: usize = TRAILING_REGION_DATA_PAGES_OFFSET + size_of::<u32>();
 const TRANSACTION_SIZE: usize = 128;
 const TRANSACTION_0_OFFSET: usize = 64;
 const TRANSACTION_1_OFFSET: usize = TRANSACTION_0_OFFSET + TRANSACTION_SIZE;
@@ -100,6 +101,7 @@ pub(super) struct DatabaseHeader {
     pub(super) recovery_required: bool,
     pub(super) two_phase_commit: bool,
     page_size: u32,
+    pub(super) node_size: u32,
     region_header_pages: u32,
     region_max_data_pages: u32,
     full_regions: u32,
@@ -118,6 +120,15 @@ impl UnrepairedDatabaseHeader {
         let recovery_required = (data[GOD_BYTE_OFFSET] & RECOVERY_REQUIRED) != 0;
         let two_phase_commit = (data[GOD_BYTE_OFFSET] & TWO_PHASE_COMMIT) != 0;
         let page_size = get_u32(&data[PAGE_SIZE_OFFSET..]);
+        // Geometry is immutable; an inactive commit slot's version byte may be corrupt.
+        let node_size = if page_size == 256 {
+            get_u32(&data[NODE_SIZE_OFFSET..])
+        } else {
+            page_size
+        };
+        if node_size < 512 || !node_size.is_power_of_two() {
+            return Err(StorageError::Corrupted("Invalid node size".to_string()).into());
+        }
         let region_header_pages = get_u32(&data[REGION_HEADER_PAGES_OFFSET..]);
         let region_max_data_pages = get_u32(&data[REGION_MAX_DATA_PAGES_OFFSET..]);
         let full_regions = get_u32(&data[NUM_FULL_REGIONS_OFFSET..]);
@@ -133,16 +144,21 @@ impl UnrepairedDatabaseHeader {
             ))
             .into());
         }
-        // A region holds 1..=MAX_PAGE_INDEX + 1 pages (the page index is 20 bits); a larger count
+        // A region holds 1..=MAX_PAGE_INDEX + 1 pages (the page index is 24 bits); a larger count
         // would alias high pages onto low ones.
-        if region_max_data_pages == 0 || region_max_data_pages > MAX_PAGE_INDEX + 1 {
+        let max_page_index = if page_size == 256 {
+            MAX_PAGE_INDEX
+        } else {
+            0x000F_FFFF
+        };
+        if region_max_data_pages == 0 || region_max_data_pages > max_page_index + 1 {
             return Err(StorageError::Corrupted(format!(
                 "Invalid region data page count: {region_max_data_pages}"
             ))
             .into());
         }
         // 0 is valid (v3 has no region header); cap it to keep the region-size math from overflowing.
-        if region_header_pages > MAX_PAGE_INDEX + 1 {
+        if region_header_pages > max_page_index + 1 {
             return Err(StorageError::Corrupted(format!(
                 "Invalid region header page count: {region_header_pages}"
             ))
@@ -176,6 +192,19 @@ impl UnrepairedDatabaseHeader {
         let (slot1, slot1_corrupted) = TransactionHeader::from_bytes(
             &data[TRANSACTION_1_OFFSET..(TRANSACTION_1_OFFSET + TRANSACTION_SIZE)],
         )?;
+        let expected_version = if page_size == 256 {
+            FILE_FORMAT_VERSION4
+        } else {
+            FILE_FORMAT_VERSION3
+        };
+        for (slot, corrupted) in [(&slot0, slot0_corrupted), (&slot1, slot1_corrupted)] {
+            if !corrupted && slot.version != expected_version {
+                return Err(StorageError::Corrupted(
+                    "Commit format does not match allocation geometry".to_string(),
+                )
+                .into());
+            }
+        }
         let (primary_corrupted, secondary_corrupted) = if primary_slot == 0 {
             (slot0_corrupted, slot1_corrupted)
         } else {
@@ -188,6 +217,7 @@ impl UnrepairedDatabaseHeader {
                 recovery_required,
                 two_phase_commit,
                 page_size,
+                node_size,
                 region_header_pages,
                 region_max_data_pages,
                 full_regions,
@@ -274,7 +304,8 @@ impl UnrepairedDatabaseHeader {
             (u64::from(region_header_pages) + u64::from(region_max_pages)) * u64::from(page_size);
         // At most MAX_REGIONS regions are addressable; a longer file would alias high regions onto
         // low ones or overflow the u32 region count.
-        let max_addressable_len = u64::from(page_size) + u64::from(MAX_REGIONS) * full_region_size;
+        let max_addressable_len =
+            u64::from(page_size).max(512) + u64::from(MAX_REGIONS) * full_region_size;
         if file_len > max_addressable_len {
             return Err(StorageError::Corrupted(format!(
                 "File length requires more regions than are addressable: file_len={file_len}"
@@ -283,7 +314,8 @@ impl UnrepairedDatabaseHeader {
         // The smallest layout is the super-header page plus a trailing region holding its header and
         // one data page; a shorter file maps to zero regions, which no layout can represent and
         // which underflows recalculate()'s arithmetic.
-        let min_len = u64::from(page_size) * (u64::from(region_header_pages) + 2);
+        let min_len = u64::from(page_size).max(512)
+            + u64::from(page_size) * (u64::from(region_header_pages) + 1);
         if file_len < min_len {
             return Err(StorageError::Corrupted(format!(
                 "File truncated below the minimum layout: file_len={file_len}"
@@ -366,6 +398,7 @@ impl DatabaseHeader {
             recovery_required: true,
             two_phase_commit: false,
             page_size: layout.full_region_layout().page_size(),
+            node_size: layout.full_region_layout().page_size(),
             region_header_pages: layout.full_region_layout().get_header_pages(),
             region_max_data_pages: layout.full_region_layout().num_pages(),
             full_regions: layout.num_full_regions(),
@@ -441,7 +474,9 @@ impl DatabaseHeader {
         user_root: Option<BtreeHeader>,
         system_root: Option<BtreeHeader>,
     ) {
+        let version = self.primary_slot().version;
         let slot = &mut self.transaction_slots[self.primary_slot ^ 1];
+        slot.version = version;
         slot.transaction_id = transaction_id;
         slot.user_root = user_root;
         slot.system_root = system_root;
@@ -466,6 +501,8 @@ impl DatabaseHeader {
         }
         result[PAGE_SIZE_OFFSET..(PAGE_SIZE_OFFSET + size_of::<u32>())]
             .copy_from_slice(&self.page_size.to_le_bytes());
+        result[NODE_SIZE_OFFSET..NODE_SIZE_OFFSET + size_of::<u32>()]
+            .copy_from_slice(&self.node_size.to_le_bytes());
         result[REGION_HEADER_PAGES_OFFSET..(REGION_HEADER_PAGES_OFFSET + size_of::<u32>())]
             .copy_from_slice(&self.region_header_pages.to_le_bytes());
         result[REGION_MAX_DATA_PAGES_OFFSET..(REGION_MAX_DATA_PAGES_OFFSET + size_of::<u32>())]
@@ -499,7 +536,7 @@ pub(super) struct TransactionHeader {
 impl TransactionHeader {
     fn new(transaction_id: TransactionId) -> Self {
         Self {
-            version: FILE_FORMAT_VERSION3,
+            version: FILE_FORMAT_VERSION4,
             user_root: None,
             system_root: None,
             transaction_id,
@@ -514,10 +551,10 @@ impl TransactionHeader {
             FILE_FORMAT_VERSION1 | FILE_FORMAT_VERSION2 => {
                 return Err(DatabaseError::UpgradeRequired(version));
             }
-            FILE_FORMAT_VERSION3 => {}
+            FILE_FORMAT_VERSION3 | FILE_FORMAT_VERSION4 => {}
             _ => {
                 return Err(StorageError::Corrupted(format!(
-                    "Expected file format version <= {FILE_FORMAT_VERSION3}, found {version}",
+                    "Expected file format version <= {FILE_FORMAT_VERSION4}, found {version}",
                 ))
                 .into());
             }
@@ -569,7 +606,10 @@ impl TransactionHeader {
         if let Some(bytes) = self.corrupt_bytes {
             return bytes;
         }
-        assert_eq!(self.version, FILE_FORMAT_VERSION3);
+        assert!(matches!(
+            self.version,
+            FILE_FORMAT_VERSION3 | FILE_FORMAT_VERSION4
+        ));
         let mut result = [0; TRANSACTION_SIZE];
         result[VERSION_OFFSET] = self.version;
         if let Some(header) = self.user_root {

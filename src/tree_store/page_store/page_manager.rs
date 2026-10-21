@@ -33,7 +33,7 @@ use core::cmp::{max, min};
 use core::convert::TryInto;
 use core::mem;
 use core::ops::{Bound, Deref, Range};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "logging")]
 use log::warn;
 
@@ -44,7 +44,7 @@ const NO_HEADER: u32 = 0;
 // Regions have a maximum size of 4GiB. A `4GiB - overhead` value is the largest that can be represented,
 // because the leaf node format uses 32bit offsets
 const MAX_USABLE_REGION_SPACE: u64 = 4 * 1024 * 1024 * 1024;
-// A region holds at most `MAX_PAGE_INDEX + 1` pages (the page index within a region is 20 bits),
+// A region holds at most `MAX_PAGE_INDEX + 1` pages (the page index within a region is 24 bits),
 // so the largest buddy-allocator order any region can have is log2(MAX_PAGE_INDEX + 1).
 // `u32::ilog2` is always <= 31, so the cast to u8 is lossless.
 #[allow(clippy::cast_possible_truncation)]
@@ -66,6 +66,8 @@ pub(crate) const FILE_FORMAT_VERSION2: u8 = 2;
 //   This is a system table. It is only written when a savepoint exists
 // * New persistent savepoint format
 pub(crate) const FILE_FORMAT_VERSION3: u8 = 3;
+// Fine-grained contiguous extents; node size is independent of the allocation quantum.
+pub(crate) const FILE_FORMAT_VERSION4: u8 = 4;
 
 #[derive(Copy, Clone)]
 pub(crate) enum ShrinkPolicy {
@@ -178,6 +180,8 @@ pub(crate) struct PageAllocator {
     mem: Arc<TransactionalMemory>,
     policy: AllocationPolicy,
     allocated_since_commit: Arc<UncommittedPages>,
+    evacuation_attempts: Arc<AtomicUsize>,
+    evacuation_bytes: Arc<AtomicUsize>,
 }
 
 impl PageAllocator {
@@ -186,6 +190,8 @@ impl PageAllocator {
             mem,
             policy,
             allocated_since_commit: Arc::new(UncommittedPages::new()),
+            evacuation_attempts: Arc::new(AtomicUsize::new(256)),
+            evacuation_bytes: Arc::new(AtomicUsize::new(1024 * 1024)),
         }
     }
 
@@ -284,7 +290,60 @@ impl PageAllocator {
     }
 
     pub(crate) fn get_page_size(&self) -> usize {
-        self.mem.get_page_size()
+        self.mem.node_size as usize
+    }
+
+    // Only called on siblings of the mutation path. No tree walk, no file growth, and
+    // at most 256 probes and 1 MiB copied for the entire transaction, across all tables.
+    pub(crate) fn try_evacuate<'a>(
+        &self,
+        page: PageNumber,
+        allocated: &PageTracker,
+    ) -> Result<Option<PageMut<'a>>> {
+        let size = self.allocation_bytes(page);
+        if self.mem.format_version != FILE_FORMAT_VERSION4
+            || size > 8192
+            || self.uncommitted(page)
+            || self
+                .evacuation_attempts
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_err()
+        {
+            return Ok(None);
+        }
+        let size = usize::try_from(size).unwrap();
+        if self
+            .evacuation_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(size)
+            })
+            .is_err()
+        {
+            return Ok(None);
+        }
+        // Reserve before any source read, including with concurrent table mutations.
+        let original = self.get_page(page, PageHint::None)?;
+        let mut result = self.mem.allocate_helper_below(size, true, Some(page))?;
+        if let Some(ref mut new_page) = result {
+            self.allocated_since_commit
+                .insert(new_page.get_page_number());
+            allocated.insert(new_page.get_page_number());
+            new_page.memory_mut().copy_from_slice(original.memory());
+        } else {
+            self.evacuation_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn can_evacuate(&self) -> bool {
+        self.mem.format_version == FILE_FORMAT_VERSION4
+            && self.evacuation_attempts.load(Ordering::Relaxed) > 0
+    }
+
+    pub(crate) fn allocation_bytes(&self, page: PageNumber) -> u64 {
+        page.page_size_bytes(self.mem.page_size)
     }
 }
 
@@ -679,6 +738,8 @@ pub(crate) struct TransactionalMemory {
     // read-only handle
     writer_lock: Option<Arc<WriterLock>>,
     page_size: u32,
+    node_size: u32,
+    format_version: u8,
     // We store these separately from the layout because they're static, and accessed on the get_page()
     // code path where there is no locking
     region_size: u64,
@@ -1093,14 +1154,8 @@ impl TransactionalMemory {
     ) -> Result<(Self, Option<Arc<WriterLock>>), DatabaseError> {
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
 
-        let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
-        let region_size = min(
-            region_size,
-            (u64::from(MAX_PAGE_INDEX) + 1) * page_size as u64,
-        );
-        assert!(region_size.is_power_of_two());
-
-        let storage = Arc::new(PagedCachedFile::new(file, page_size as u64, cache_size));
+        let node_size = page_size;
+        let storage = Arc::new(PagedCachedFile::new(file, 256, cache_size));
         // Dropping the storage releases whatever this took, so an open that fails below does too
         Self::lock_for_open(&storage, read_only, concurrency_mode)?;
         let writer_lock = database_writer_lock_for_mode(&storage, read_only, concurrency_mode);
@@ -1149,6 +1204,24 @@ impl TransactionalMemory {
             }
         }
 
+        // v4 uses 256-byte allocation units regardless of the target node size. v3 databases
+        // keep their existing geometry; their data remains readable and writable in place.
+        let page_size = if initial_storage_len == 0 {
+            256
+        } else {
+            let prefix = storage.read_direct(0, DB_HEADER_SIZE)?;
+            if u32::from_le_bytes(prefix[12..16].try_into().unwrap()) == 256 {
+                256
+            } else {
+                node_size
+            }
+        };
+        let region_size = min(
+            requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE),
+            (u64::from(MAX_PAGE_INDEX) + 1) * page_size as u64,
+        );
+        assert!(region_size.is_power_of_two());
+
         if magic_number != MAGICNUMBER {
             let region_tracker_required_bytes =
                 RegionTracker::new(INITIAL_REGIONS, MAX_MAX_PAGE_ORDER + 1)
@@ -1183,6 +1256,7 @@ impl TransactionalMemory {
             }
 
             let mut header = DatabaseHeader::new(layout, TransactionId::new(0));
+            header.node_size = node_size.try_into().unwrap();
 
             header.recovery_required = false;
             header.two_phase_commit = true;
@@ -1212,9 +1286,11 @@ impl TransactionalMemory {
         let layout = header.layout();
         let region_size = layout.full_region_layout().len();
         let region_header_size = layout.full_region_layout().data_section().start;
+        let node_size = header.node_size;
+        let format_version = header.primary_slot().version;
         let state = InMemoryState::new(header);
 
-        assert!(page_size >= DB_HEADER_SIZE);
+        assert!(page_size.max(512) >= DB_HEADER_SIZE);
 
         let mem = Self {
             unpersisted: Mutex::new(UnpersistedState::default()),
@@ -1233,6 +1309,8 @@ impl TransactionalMemory {
             scan_from: Mutex::new(0),
             writer_lock,
             page_size: page_size.try_into().unwrap(),
+            node_size,
+            format_version,
             region_size,
             region_header_with_padding_size: region_header_size,
         };
@@ -1242,10 +1320,16 @@ impl TransactionalMemory {
 
     // An order read from a corrupted file would otherwise size a multi-terabyte read buffer, whose
     // failed allocation aborts the process instead of returning an error.
-    fn check_page_order(page: PageNumber) -> Result<()> {
-        if page.page_order > MAX_MAX_PAGE_ORDER {
+    fn check_page_order(&self, page: PageNumber) -> Result<()> {
+        let region_pages =
+            (self.region_size - self.region_header_with_padding_size) / u64::from(self.page_size);
+        if u32::from(page.page_order) > region_pages.ilog2()
+            || (page.used_pages != 0
+                && (page.page_order != 0 || self.format_version != FILE_FORMAT_VERSION4))
+            || u64::from(page.start_page()) + u64::from(page.base_pages()) > region_pages
+        {
             return Err(StorageError::Corrupted(format!(
-                "Page {page:?} has order greater than the maximum of {MAX_MAX_PAGE_ORDER}"
+                "Page {page:?} has invalid order or extends past its region"
             )));
         }
         Ok(())
@@ -1541,7 +1625,7 @@ impl TransactionalMemory {
     // The freed tables name pages that no page walk ever reads, so this is the only place those
     // page numbers are validated.
     pub(crate) fn mark_page_allocated(&self, page_number: PageNumber) -> Result<()> {
-        Self::check_page_order(page_number)?;
+        self.check_page_order(page_number)?;
         let mut state = self.state.lock()?;
         // Unlike the read path, this is only reached while rebuilding the allocator state, and the
         // state lock is already held, so validating against the layout costs nothing here
@@ -1555,7 +1639,7 @@ impl TransactionalMemory {
         }
         let region_pages = u64::from(layout.region_layout(page_number.region).num_pages());
         // Cannot overflow: page_index is at most 2^32, and the order was bounded above
-        let end_page = (u64::from(page_number.page_index) + 1) << page_number.page_order;
+        let end_page = u64::from(page_number.start_page()) + u64::from(page_number.base_pages());
         if end_page > region_pages {
             return Err(StorageError::Corrupted(format!(
                 "Page {page_number:?} extends past the end of its region, which has {region_pages} pages"
@@ -1563,11 +1647,22 @@ impl TransactionalMemory {
         }
 
         let allocator = state.get_region_mut(page_number.region);
-        if !allocator.record_alloc(page_number.page_index, page_number.page_order) {
+        if !page_number
+            .blocks()
+            .all(|block| allocator.record_alloc(block.page_index, block.page_order))
+        {
             return Err(StorageError::Corrupted(format!(
                 "Page {page_number:?} overlaps a page that is already allocated"
             )));
         }
+        let largest = allocator.max_run();
+        let highest = allocator.highest_free_order();
+        state
+            .get_region_tracker_mut()
+            .update_run(page_number.region, largest);
+        state
+            .get_region_tracker_mut()
+            .update_free_order(page_number.region, highest);
         #[cfg(debug_assertions)]
         assert!(self.allocated_pages.lock().unwrap().insert(page_number));
 
@@ -1735,6 +1830,10 @@ impl TransactionalMemory {
         // Resize the allocators to match the current file size
         let layout = state.header.layout();
         state.allocators_mut().resize_to(layout);
+        for region in 0..layout.num_regions() {
+            let largest = state.get_region(region).max_run();
+            state.get_region_tracker_mut().update_run(region, largest);
+        }
         drop(state);
 
         self.state.lock().unwrap().header.recovery_required = false;
@@ -1868,9 +1967,9 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
-        Self::check_page_order(page_number)?;
+        self.check_page_order(page_number)?;
         let range = page_number.address_range(
-            self.page_size.into(),
+            u64::from(self.page_size).max(512),
             self.region_size,
             self.region_header_with_padding_size,
             self.page_size,
@@ -1902,7 +2001,7 @@ impl TransactionalMemory {
 
     // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
     pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
-        Self::check_page_order(page_number)?;
+        self.check_page_order(page_number)?;
         #[cfg(debug_assertions)]
         {
             assert!(
@@ -1916,7 +2015,7 @@ impl TransactionalMemory {
         }
 
         let address_range = page_number.address_range(
-            self.page_size.into(),
+            u64::from(self.page_size).max(512),
             self.region_size,
             self.region_header_with_padding_size,
             self.page_size,
@@ -2023,17 +2122,21 @@ impl TransactionalMemory {
         let region_index = page.region;
         // Free in the regional allocator. free() returns the order of the resulting block, which is
         // larger than page_order when buddies merged.
-        let freed_order = state
-            .get_region_mut(region_index)
-            .free(page.page_index, page.page_order);
-        // Mark the region free at the merged order, not just page_order: leaving the tracker's
-        // higher-order bits stale after a merge would hide the reclaimed space from find_free.
+        for block in page.blocks() {
+            let freed_order = state
+                .get_region_mut(region_index)
+                .free(block.page_index, block.page_order);
+            state
+                .get_region_tracker_mut()
+                .mark_free(freed_order, region_index);
+        }
+
+        let largest = state.get_region(region_index).max_run();
         state
             .get_region_tracker_mut()
-            .mark_free(freed_order, region_index);
-
+            .update_run(region_index, largest);
         let address_range = page.address_range(
-            self.page_size.into(),
+            u64::from(self.page_size).max(512),
             self.region_size,
             self.region_header_with_padding_size,
             self.page_size,
@@ -2172,19 +2275,66 @@ impl TransactionalMemory {
         allocation_size: usize,
         lowest: bool,
     ) -> Result<PageMut<'txn>> {
+        Ok(self
+            .allocate_helper_below(allocation_size, lowest, None)?
+            .unwrap())
+    }
+
+    fn allocate_helper_below<'txn>(
+        &self,
+        allocation_size: usize,
+        lowest: bool,
+        upper_bound: Option<PageNumber>,
+    ) -> Result<Option<PageMut<'txn>>> {
         let required_pages = allocation_size.div_ceil(self.get_page_size());
         let required_order = ceil_log2(required_pages);
+        let exact_pages = if self.format_version == FILE_FORMAT_VERSION4
+            && (1..=0x7FFF).contains(&required_pages)
+        {
+            Some(u32::try_from(required_pages).unwrap())
+        } else {
+            None
+        };
 
         let mut state = self.state.lock().unwrap();
 
+        if let Some(upper) = upper_bound {
+            let allocator = state.get_region_mut(upper.region);
+            let start = upper.start_page();
+            if start < allocator.len() / 2 || !allocator.should_evacuate() {
+                return Ok(None);
+            }
+        }
+
         let page_number = if let Some(page_number) =
-            Self::allocate_helper_retry(&mut state, required_order, lowest)?
+            Self::allocate_helper_retry(&mut state, required_order, lowest, exact_pages)?
         {
             page_number
         } else {
+            if upper_bound.is_some() {
+                return Ok(None);
+            }
             self.grow(&mut state, required_order)?;
-            Self::allocate_helper_retry(&mut state, required_order, lowest)?.unwrap()
+            Self::allocate_helper_retry(&mut state, required_order, lowest, exact_pages)?.unwrap()
         };
+
+        if let Some(upper) = upper_bound
+            && (page_number.region, page_number.start_page()) >= (upper.region, upper.start_page())
+        {
+            for block in page_number.blocks() {
+                let order = state
+                    .get_region_mut(block.region)
+                    .free(block.page_index, block.page_order);
+                state
+                    .get_region_tracker_mut()
+                    .mark_free(order, block.region);
+            }
+            let largest = state.get_region(page_number.region).max_run();
+            state
+                .get_region_tracker_mut()
+                .update_run(page_number.region, largest);
+            return Ok(None);
+        }
 
         #[cfg(debug_assertions)]
         {
@@ -2201,7 +2351,7 @@ impl TransactionalMemory {
         }
 
         let address_range = page_number.address_range(
-            self.page_size.into(),
+            u64::from(self.page_size).max(512),
             self.region_size,
             self.region_header_with_padding_size,
             self.page_size,
@@ -2222,31 +2372,61 @@ impl TransactionalMemory {
             mem.mem_mut().fill(0xFF);
         }
 
-        Ok(PageMut {
+        Ok(Some(PageMut {
             mem,
             page_number,
             _lifetime: ScopedBorrow::default(),
             #[cfg(debug_assertions)]
             open_pages: self.open_dirty_pages.clone(),
-        })
+        }))
     }
 
     fn allocate_helper_retry(
         state: &mut InMemoryState,
         required_order: u8,
         lowest: bool,
+        exact_pages: Option<u32>,
     ) -> Result<Option<PageNumber>> {
         loop {
-            let Some(candidate_region) = state.get_region_tracker_mut().find_free(required_order)
-            else {
+            let candidate = if let Some(pages) = exact_pages {
+                state.get_region_tracker_mut().find_run(pages)
+            } else {
+                state.get_region_tracker_mut().find_free(required_order)
+            };
+            let Some(candidate_region) = candidate else {
                 return Ok(None);
             };
             let region = state.get_region_mut(candidate_region);
+            if let Some(pages) = exact_pages {
+                let start = region.alloc_run(pages);
+                let largest = region.max_run();
+                let highest = region.highest_free_order();
+                state
+                    .get_region_tracker_mut()
+                    .update_run(candidate_region, largest);
+                state
+                    .get_region_tracker_mut()
+                    .update_free_order(candidate_region, highest);
+                if let Some(start) = start {
+                    let mut page = PageNumber::new(candidate_region, start, 0);
+                    page.used_pages = u16::try_from(pages).unwrap();
+                    return Ok(Some(page));
+                }
+                continue;
+            }
             let r = if lowest {
                 region.alloc_lowest(required_order)
             } else {
                 region.alloc(required_order)
             };
+            let largest = region.max_run();
+            let highest = region.highest_free_order();
+            state
+                .get_region_tracker_mut()
+                .update_run(candidate_region, largest);
+            state
+                .get_region_tracker_mut()
+                .update_free_order(candidate_region, highest);
             if let Some(page) = r {
                 return Ok(Some(PageNumber::new(
                     candidate_region,
@@ -2292,10 +2472,33 @@ impl TransactionalMemory {
             if trailing_free == 0 {
                 break;
             }
-            if trailing_free < last_allocator_len / 2 && !force {
+            let fine_grained = state.header.primary_slot().version == FILE_FORMAT_VERSION4;
+            let reserve_bytes = (layout.usable_bytes() / 64).clamp(64 * 1024, 1024 * 1024);
+            let reserve_pages =
+                (reserve_bytes / u64::from(layout.full_region_layout().page_size())) as u32;
+            let remove_region = fine_grained
+                && layout.num_regions() > 1
+                && trailing_free == last_allocator_len
+                && last_allocator_len <= 1024 * 1024 / layout.full_region_layout().page_size()
+                && state
+                    .get_region_tracker_mut()
+                    .has_reserve_outside(reserve_pages, last_region_index);
+            if !force && fine_grained && !remove_region && trailing_free < 2 * reserve_pages {
                 break;
             }
-            let reduce_by = if layout.num_regions() > 1 && trailing_free == last_allocator_len {
+            if trailing_free < last_allocator_len / 2 && !force && !fine_grained {
+                break;
+            }
+            let reduce_by = if !force && remove_region {
+                trailing_free
+            } else if !force && fine_grained {
+                // At most 1 MiB of allocator resizing per commit. Keep a reserve and use a
+                // separate shrink threshold, so boundary churn does not resize every commit.
+                min(
+                    trailing_free - reserve_pages,
+                    1024 * 1024 / layout.full_region_layout().page_size(),
+                )
+            } else if layout.num_regions() > 1 && trailing_free == last_allocator_len {
                 trailing_free
             } else if force {
                 // Do not shrink the database to zero size
@@ -2327,7 +2530,10 @@ impl TransactionalMemory {
             2u64.pow(required_order_allocation.into()) * u64::from(state.header.page_size());
         let max_region_size = u64::from(state.header.layout().full_region_layout().num_pages())
             * u64::from(state.header.page_size());
-        let next_desired_size = if layout.num_full_regions() > 0 {
+        let next_desired_size = if self.format_version == FILE_FORMAT_VERSION4 {
+            let increment = (layout.usable_bytes() / 64).clamp(64 * 1024, 1024 * 1024);
+            layout.usable_bytes() + max(increment, 2 * required_growth)
+        } else if layout.num_full_regions() > 0 {
             if let Some(trailing) = layout.trailing_region_layout() {
                 if 2 * required_growth < max_region_size - trailing.usable_bytes() {
                     // Fill out the trailing region
@@ -2467,6 +2673,217 @@ impl TransactionalMemory {
 mod test {
     use crate::tree_store::page_store::page_manager::INITIAL_REGIONS;
     use crate::{Database, TableDefinition};
+
+    #[test]
+    fn exact_allocations_keep_large_allocation_candidates_current() {
+        use super::TransactionalMemory;
+        use crate::tree_store::InMemoryBackend;
+
+        let (mem, _lock) = TransactionalMemory::new(
+            Box::new(InMemoryBackend::new()),
+            true,
+            4096,
+            Some(64 * 1024),
+            0,
+            false,
+            crate::db::ConcurrencyMode::ExclusiveWriter,
+        )
+        .unwrap();
+        mem.reset_allocator_state().unwrap();
+        let mut state = mem.state.lock().unwrap();
+        assert!(state.header.layout().num_regions() > 3);
+
+        // A 17-unit extent crosses buddy boundaries. Fifteen such extents leave
+        // one unit in each 256-unit region, unsuitable for a 32-unit allocation.
+        for region in 0..3 {
+            for _ in 0..15 {
+                let page =
+                    TransactionalMemory::allocate_helper_retry(&mut state, 5, false, Some(17))
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(page.region, region);
+            }
+            assert_eq!(state.get_region(region).count_free_pages(), 1);
+            assert_eq!(
+                state.get_region_tracker_mut().find_free(5),
+                Some(region + 1)
+            );
+        }
+        let large = TransactionalMemory::allocate_helper_retry(&mut state, 5, false, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(large.region, 3);
+        assert_eq!(large.base_pages(), 32);
+
+        while TransactionalMemory::allocate_helper_retry(&mut state, 5, false, Some(17))
+            .unwrap()
+            .is_some()
+        {}
+        // No unsuccessful per-region probes should be needed to discover this.
+        assert_eq!(state.get_region_tracker_mut().find_free(5), None);
+        assert!(
+            TransactionalMemory::allocate_helper_retry(&mut state, 5, false, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn normal_shrink_removes_an_empty_trailing_region_with_a_reserve_elsewhere() {
+        use super::TransactionalMemory;
+        use crate::tree_store::InMemoryBackend;
+        let (mem, _lock) = TransactionalMemory::new(
+            Box::new(InMemoryBackend::new()),
+            true,
+            4096,
+            Some(64 * 1024),
+            0,
+            false,
+            crate::db::ConcurrencyMode::ExclusiveWriter,
+        )
+        .unwrap();
+        mem.reset_allocator_state().unwrap();
+        let mut state = mem.state.lock().unwrap();
+        let before = state.header.layout();
+        assert!(before.num_regions() > 1);
+        assert!(TransactionalMemory::try_shrink(&mut state, false).unwrap());
+        let after = state.header.layout();
+        assert_eq!(after.num_regions(), before.num_regions() - 1);
+        assert!(before.len() - after.len() <= 1024 * 1024);
+    }
+
+    #[test]
+    fn concurrent_evacuation_reserves_budget_before_reading_candidates() {
+        use super::{AllocationPolicy, PageAllocator, TransactionalMemory};
+        use crate::StorageBackend;
+        use crate::tree_store::{InMemoryBackend, Page, PageTracker};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        #[derive(Debug)]
+        struct CountingBackend {
+            inner: InMemoryBackend,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl StorageBackend for CountingBackend {
+            fn len(&self) -> std::io::Result<u64> {
+                StorageBackend::len(&self.inner)
+            }
+
+            fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                StorageBackend::read(&self.inner, offset, out)
+            }
+
+            fn set_len(&self, len: u64) -> std::io::Result<()> {
+                StorageBackend::set_len(&self.inner, len)
+            }
+
+            fn sync_data(&self) -> std::io::Result<()> {
+                StorageBackend::sync_data(&self.inner)
+            }
+
+            fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+                StorageBackend::write(&self.inner, offset, data)
+            }
+        }
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (mem, _lock) = TransactionalMemory::new(
+            Box::new(CountingBackend {
+                inner: InMemoryBackend::new(),
+                reads: reads.clone(),
+            }),
+            true,
+            4096,
+            None,
+            0,
+            false,
+            crate::db::ConcurrencyMode::ExclusiveWriter,
+        )
+        .unwrap();
+        mem.reset_allocator_state().unwrap();
+        let ignore = PageTracker::ignore();
+        let prefix = mem.allocate(768 * 1024, &ignore).unwrap();
+        let prefix_number = prefix.get_page_number();
+        drop(prefix);
+        let mut source = mem.allocate(4096, &ignore).unwrap();
+        source.memory_mut().fill(0x5a);
+        source.memory_mut()[0] = crate::tree_store::btree_base::LEAF;
+        let source_number = source.get_page_number();
+        drop(source);
+        mem.storage.flush().unwrap();
+        mem.storage.invalidate_cache_all();
+        mem.free(prefix_number, &ignore);
+
+        let allocator = PageAllocator::new(Arc::new(mem), AllocationPolicy::Default);
+        allocator.evacuation_attempts.store(1, Ordering::Relaxed);
+        reads.store(0, Ordering::Relaxed);
+        let start = Arc::new(Barrier::new(16));
+        let moved: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let allocator = allocator.clone();
+                    let start = start.clone();
+                    scope.spawn(move || {
+                        start.wait();
+                        let page = allocator
+                            .try_evacuate(source_number, &PageTracker::ignore())
+                            .unwrap();
+                        if let Some(page) = page {
+                            assert!(page.get_page_number() < source_number);
+                            assert!(page.memory()[1..].iter().all(|byte| *byte == 0x5a));
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum()
+        });
+        assert_eq!(moved, 1);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn evacuation_budget_is_shared_by_allocator_clones() {
+        use super::{AllocationPolicy, PageAllocator, TransactionalMemory};
+        use crate::tree_store::{InMemoryBackend, Page, PageTracker};
+        use std::sync::Arc;
+
+        let (mem, _lock) = TransactionalMemory::new(
+            Box::new(InMemoryBackend::new()),
+            true,
+            4096,
+            None,
+            0,
+            false,
+            crate::db::ConcurrencyMode::ExclusiveWriter,
+        )
+        .unwrap();
+        mem.reset_allocator_state().unwrap();
+        let ignore = PageTracker::ignore();
+        let mut source = mem.allocate(4096, &ignore).unwrap();
+        source.memory_mut().fill(0);
+        source.memory_mut()[0] = crate::tree_store::btree_base::LEAF;
+        let page = source.get_page_number();
+        drop(source);
+        let allocator = PageAllocator::new(Arc::new(mem), AllocationPolicy::Lowest);
+        let clone = allocator.clone();
+        for index in 0..256 {
+            assert!(allocator.can_evacuate() && clone.can_evacuate());
+            let selected = if index % 2 == 0 { &allocator } else { &clone };
+            // The address is already at the bottom, so each probe must do no allocation.
+            assert!(selected.try_evacuate(page, &ignore).unwrap().is_none());
+        }
+        assert!(!allocator.can_evacuate() && !clone.can_evacuate());
+        assert_eq!(allocator.mem.count_allocated_pages().unwrap(), 16);
+    }
 
     // Test that the region tracker expansion code works, by adding more data than fits into the initial max regions
     #[test]
@@ -2841,12 +3258,9 @@ mod header_lock_test {
 
         fn unclean(path: &Path) -> bool {
             let bytes = std::fs::read(path).unwrap();
-            UnrepairedDatabaseHeader::from_bytes(
-                &bytes[..DB_HEADER_SIZE],
-                PAGE_SIZE.try_into().unwrap(),
-            )
-            .unwrap()
-            .unclean()
+            UnrepairedDatabaseHeader::from_bytes(&bytes[..DB_HEADER_SIZE], 256)
+                .unwrap()
+                .unclean()
         }
 
         let tmpfile = crate::create_tempfile();

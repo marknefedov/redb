@@ -4,6 +4,7 @@ mod base;
 mod bitmap;
 mod buddy_allocator;
 mod cached_file;
+mod extent_index;
 mod fast_hash;
 #[cfg(not(redb_no_std))]
 pub mod file_backend;

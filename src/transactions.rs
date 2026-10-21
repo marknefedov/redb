@@ -38,7 +38,7 @@ use core::mem;
 use core::mem::size_of;
 use core::ops::{RangeBounds, RangeFull};
 use core::panic;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "logging")]
 use log::{debug, warn};
 
@@ -940,6 +940,7 @@ pub struct WriteTransaction {
     two_phase_commit: bool,
     shrink_policy: ShrinkPolicy,
     quick_repair: bool,
+    reclaim_budget: AtomicUsize,
     post_commit_free: PostCommitFree,
     // Set by a savepoint restore, to discard the in-memory freed-page records of the non-durable
     // commits it rolled back. Kept transaction-local so that an abort leaves them in place.
@@ -983,6 +984,7 @@ impl WriteTransaction {
             // A multi-writer commit records the allocator state, which `set_quick_repair()`
             // keeps on there
             quick_repair: mem.concurrency_mode() == ConcurrencyMode::MultiWriter,
+            reclaim_budget: AtomicUsize::new(256),
             post_commit_free: PostCommitFree::Enabled,
             restored_transaction: None,
             shrink_policy: ShrinkPolicy::Default,
@@ -1803,6 +1805,12 @@ impl WriteTransaction {
 
         let (user_root, allocated_pages, data_freed) =
             self.tables.lock().unwrap().table_tree.flush_and_close()?;
+        // Reclaim current write traffic plus a bounded share of historical garbage. In
+        // particular, releasing an old reader must not drain its entire backlog at once.
+        self.reclaim_budget.store(
+            data_freed.len().saturating_mul(2).saturating_add(256),
+            Ordering::Relaxed,
+        );
 
         // From here a durable commit is irreversible: it either completes or leaves the allocator
         // state invalidated, so nothing rolls back what it claims. That is what lets it take over
@@ -2209,6 +2217,7 @@ impl WriteTransaction {
                 &mut system_tables,
                 DATA_FREED_TABLE,
                 free_until,
+                &self.reclaim_budget,
                 |page| {
                     freed_any = true;
                     // See process_freed_pages(): free_until excludes pages that are still needed
@@ -2417,12 +2426,14 @@ impl WriteTransaction {
                 &mut system_tables,
                 DATA_FREED_TABLE,
                 free_until,
+                &self.reclaim_budget,
                 &mut free_page,
             )?;
             extracted_transactions.extend(Self::extract_freed_pages(
                 &mut system_tables,
                 SYSTEM_FREED_TABLE,
                 free_until,
+                &self.reclaim_budget,
                 &mut free_page,
             )?);
             extracted_transactions
@@ -2437,6 +2448,7 @@ impl WriteTransaction {
         system_tables: &mut SystemNamespace,
         definition: SystemTableDefinition<TransactionIdWithPagination, PageList>,
         free_until: TransactionId,
+        budget: &AtomicUsize,
         mut process_page: impl FnMut(PageNumber),
     ) -> Result<Vec<TransactionId>> {
         if system_tables.get_system_table_root(definition)?.is_none() {
@@ -2448,10 +2460,27 @@ impl WriteTransaction {
             transaction_id: free_until.raw_id(),
             pagination_id: 0,
         };
+        let mut remaining = budget.load(Ordering::Relaxed);
+        let mut selected = vec![];
+        let mut unfinished = None;
+        for entry in freed.range(..key)? {
+            let (entry_key, value) = entry?;
+            let entry_key = entry_key.value();
+            let len = value.value().len().max(1);
+            if remaining == 0 {
+                unfinished = Some(entry_key.transaction_id);
+                break;
+            }
+            // Freed-page records contain at most 200 pages. Complete the final record
+            // rather than stranding it; the budget can be exceeded by at most 199 pages.
+            remaining = remaining.saturating_sub(len);
+            selected.push(entry_key);
+        }
+        budget.store(remaining, Ordering::Relaxed);
         let mut extracted_transactions = vec![];
-        for entry in freed.extract_from_if(..key, |_, _| true)? {
-            let (key, page_list) = entry?;
-            let transaction_id = TransactionId::new(key.value().transaction_id);
+        for key in selected {
+            let page_list = freed.remove(&key)?.unwrap();
+            let transaction_id = TransactionId::new(key.transaction_id);
             if extracted_transactions.last().copied() != Some(transaction_id) {
                 extracted_transactions.push(transaction_id);
             }
@@ -2459,6 +2488,10 @@ impl WriteTransaction {
             for i in 0..page_list.len() {
                 process_page(page_list.get(i));
             }
+        }
+
+        if extracted_transactions.last().map(|id| id.raw_id()) == unfinished {
+            extracted_transactions.pop();
         }
 
         Ok(extracted_transactions)
@@ -2921,6 +2954,54 @@ mod test {
 
     const X: TableDefinition<&str, &str> = TableDefinition::new("x");
     const BIG_VALUE: TableDefinition<u64, &[u8]> = TableDefinition::new("big_value");
+
+    #[test]
+    fn releasing_a_reader_reclaims_backlog_in_bounded_commits() {
+        let file = crate::create_tempfile();
+        let mut db = Database::create(file.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(BIG_VALUE).unwrap();
+            for key in 0..1024 {
+                table.insert(key, &[0u8; 150][..]).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let reader = db.begin_read().unwrap();
+        for generation in 1..33u8 {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(BIG_VALUE).unwrap();
+                for key in 0..1024 {
+                    table.insert(key, &[generation; 150][..]).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            reader
+                .open_table(BIG_VALUE)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[0u8; 150]
+        );
+        let before = db.begin_write().unwrap().stats().unwrap().allocated_pages();
+        drop(reader);
+        db.begin_write().unwrap().commit().unwrap();
+        let after = db.begin_write().unwrap().stats().unwrap().allocated_pages();
+        // 256 cleanup pages plus the final record (at most 200), each at most 16
+        // allocation units here, and a small allowance for system-tree reclamation.
+        assert!(before.saturating_sub(after) <= 456 * 16 + 256);
+        for _ in 0..64 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+        let drained = db.begin_write().unwrap().stats().unwrap().allocated_pages();
+        assert!(drained < before / 2, "{before} -> {after} -> {drained}");
+        assert!(db.check_integrity().unwrap());
+    }
 
     // A persistent savepoint takes no "active transaction byte", so nothing on the way in checks
     // that its transaction id is one the multi-process protocol can represent. The file names it,

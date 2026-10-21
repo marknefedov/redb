@@ -1,0 +1,126 @@
+name: Space benchmark
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: space-benchmark-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_BENCH_DEBUG: 0
+      REDB_SPACE_ENTRIES: 512000
+      REDB_SPACE_OUTPUT: ${{ github.workspace }}/space-results.json
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes libclang-dev
+      - name: Validate report parser
+        run: python3 -m unittest discover -s scripts -p test_space_report.py
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - uses: actions/cache/restore@v5
+        id: bench-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            target/release
+          key: space-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain', '.github/workflows/space-benchmark.yml') }}
+      - name: Build comparison engines
+        run: cargo bench --locked --no-run -p redb-bench-compare --bench space_benchmark
+      - name: Save compiled engines
+        if: steps.bench-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            target/release
+          key: ${{ steps.bench-cache.outputs.cache-primary-key }}
+      - name: Measure normal writes without redb compaction
+        run: cargo bench --locked -p redb-bench-compare --bench space_benchmark
+      - name: Render results and check size target
+        if: always()
+        run: python3 scripts/space-report.py space-results.json --output space-results.md --max-ratio 1.5
+      - name: Job summary
+        if: always()
+        run: cat space-results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: space-results
+          path: space-results.json
+          if-no-files-found: error
+
+  comment:
+    needs: benchmark
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: space-results
+          path: space-artifact
+      # No checkout and no execution of benchmark artifacts in the job with a write token.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'space-artifact/space-results.json';
+            if (fs.statSync(path).size > 256 * 1024) throw new Error('Oversized report');
+            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const num = n => {
+              if (!Number.isSafeInteger(n) || n < 0) throw new Error('Invalid numeric result');
+              return n;
+            };
+            if (data.schema !== 1 || data.rocksdb_compression !== 'lz4' || !Array.isArray(data.results) || data.results.length !== 16)
+              throw new Error('Invalid report schema');
+            const lines = [
+              `${num(data.entries)} initial entries; ${num(data.batch_size)} records per synchronous transaction. RocksDB uses LZ4. No redb compaction.`, '',
+              '| Value bytes | Phase | redb MiB | RocksDB online MiB | RocksDB compacted MiB | Ratio | redb p99 / p99.9 / max ms |',
+              '|---:|---|---:|---:|---:|---:|---:|'
+            ];
+            const seen = new Set();
+            for (const row of data.results) {
+              if (![32, 150, 1024, 4096].includes(row.value_bytes) ||
+                  !['load', 'delete_half', 'churn_1', 'churn_2'].includes(row.phase))
+                throw new Error('Invalid workload');
+              const key = `${row.value_bytes}/${row.phase}`;
+              if (seen.has(key)) throw new Error('Duplicate workload');
+              seen.add(key);
+              const redb = num(row.redb_bytes), rocks = num(row.rocksdb_compacted_bytes);
+              if (!rocks) throw new Error('Empty reference');
+              const times = ['p99_us', 'p999_us', 'max_us'].map(k => (num(row.redb_latency[k]) / 1000).toFixed(3)).join(' / ');
+              lines.push(`| ${row.value_bytes} | ${row.phase} | ${(redb / 2**20).toFixed(2)} | ${(num(row.rocksdb_online_bytes) / 2**20).toFixed(2)} | ${(rocks / 2**20).toFixed(2)} | ${(redb / rocks).toFixed(2)}x | ${times} |`);
+            }
+            lines.push('', 'The 1.5x target applies after load and the second churn cycle. Transient deletion/churn sizes are also shown. Latency excludes RocksDB reference flush/compaction; shared-runner timing is diagnostic.');
+            const issue_number = context.issue.number;
+            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: issue_number});
+            if (pr.head.sha !== context.payload.pull_request.head.sha || pr.state !== 'open') return;
+            const marker = '<!-- redb-space-benchmark -->';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `${marker}\nResults for ${pr.head.sha}\n\n${lines.join('\n')}\n\n[Benchmark run](${runUrl})`;
+            const comments = await github.paginate(github.rest.issues.listComments, {...context.repo, issue_number});
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (existing) await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
+            else await github.rest.issues.createComment({...context.repo, issue_number, body});
+

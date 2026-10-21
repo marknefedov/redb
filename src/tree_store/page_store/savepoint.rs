@@ -2,7 +2,7 @@ use crate::db::TransactionGuard;
 use crate::transaction_tracker::{
     LocalSavepointId, SavepointId, TransactionId, TransactionTracker,
 };
-use crate::tree_store::page_store::page_manager::FILE_FORMAT_VERSION3;
+use crate::tree_store::page_store::page_manager::{FILE_FORMAT_VERSION3, FILE_FORMAT_VERSION4};
 use crate::tree_store::{BtreeHeader, TransactionalMemory};
 use crate::{Result, StorageError, TypeName, Value};
 use alloc::format;
@@ -110,7 +110,10 @@ struct PersistentSavepoint {
 
 impl SerializedSavepoint<'_> {
     pub(crate) fn from_savepoint(savepoint: &Savepoint) -> Self {
-        assert_eq!(savepoint.version, FILE_FORMAT_VERSION3);
+        assert!(matches!(
+            savepoint.version,
+            FILE_FORMAT_VERSION3 | FILE_FORMAT_VERSION4
+        ));
         let mut result = vec![savepoint.version];
         result.extend(savepoint.id.0.to_le_bytes());
         result.extend(savepoint.get_transaction_id().raw_id().to_le_bytes());
@@ -171,7 +174,7 @@ impl SerializedSavepoint<'_> {
         }
         let mut offset = 0;
         let version = data[offset];
-        if version != FILE_FORMAT_VERSION3 {
+        if !matches!(version, FILE_FORMAT_VERSION3 | FILE_FORMAT_VERSION4) {
             return Err(StorageError::Corrupted(format!(
                 "Unsupported savepoint version: {version}"
             )));

@@ -1,6 +1,6 @@
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
-    LeafBuilder, LeafMutator, OwnedEntryBuffer, RawBranchBuilder, branch_separator,
+    LeafBuilder, LeafMutator, OwnedEntryBuffer, RawBranchBuilder, RawLeafBuilder, branch_separator,
     is_single_large_value, leaf_below_merge_threshold, leaf_split_required,
     retained_after_removals,
 };
@@ -78,6 +78,7 @@ enum LeafDeleteDisposition {
 struct LeafDeletePlan {
     retained_pairs: usize,
     disposition: LeafDeleteDisposition,
+    shrink: bool,
 }
 
 struct InsertionResult<'a, V: Value + 'static> {
@@ -811,6 +812,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     } else {
                         LeafMutator::sufficient_insert_inplace_space(
                             &page,
+                            self.page_allocator.get_page_size(),
                             position,
                             K::fixed_width(),
                             V::fixed_width(),
@@ -1036,12 +1038,14 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     value,
                     rightmost && child_index == accessor.count_children() - 1,
                 )?;
+                let evacuated = self.evacuate_sibling(&accessor, child_index)?;
 
                 // Skip-path: if child page number and checksum haven't changed,
                 // no branch update is needed. This avoids redundant get_page_mut +
                 // write_child_page calls on repeat visits to the same subtree
                 // within a transaction.
                 if sub_result.additional_sibling.is_none()
+                    && evacuated.is_none()
                     && sub_result.new_root == child_page
                     && sub_result.root_checksum == child_checksum
                 {
@@ -1066,6 +1070,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         sub_result.new_root,
                         sub_result.root_checksum,
                     );
+                    if let Some((index, child, checksum)) = evacuated {
+                        mutator.write_child_page(index, child, checksum);
+                    }
                     return Ok(InsertionResult {
                         new_root: mutpage.get_page_number(),
                         root_checksum: DEFERRED,
@@ -1083,11 +1090,15 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         .page_allocator
                         .allocate(page.memory().len(), self.allocated)?;
                     new_page.memory_mut().copy_from_slice(page.memory());
-                    BranchMutator::new(new_page.memory_mut()).write_child_page(
+                    let mut mutator = BranchMutator::new(new_page.memory_mut());
+                    mutator.write_child_page(
                         child_index,
                         sub_result.new_root,
                         sub_result.root_checksum,
                     );
+                    if let Some((index, child, checksum)) = evacuated {
+                        mutator.write_child_page(index, child, checksum);
+                    }
                     let new_page_number = new_page.get_page_number();
                     drop(page);
                     self.conditional_free(page_number);
@@ -1143,6 +1154,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     }
                 }
 
+                if let Some((index, child, checksum)) = evacuated {
+                    let index = index + usize::from(index > child_index);
+                    builder.replace_child(index, child, checksum);
+                }
                 let result = if builder.should_split() {
                     let (new_page1, split_key, new_page2) = builder.build_split()?;
                     InsertionResult {
@@ -1243,7 +1258,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         // Fast-path for dirty pages: perform in-place removal without allocating a new page.
         // The threshold matches the merge threshold (page_size/3) so that we use in-place
         // removal for all cases where the page won't need merging with a sibling.
-        if allow_in_place && uncommitted && plan.disposition == LeafDeleteDisposition::Rebuild {
+        if allow_in_place
+            && uncommitted
+            && plan.disposition == LeafDeleteDisposition::Rebuild
+            && !plan.shrink
+        {
             let (start, end) = accessor.value_range(position).unwrap();
             let key_guard = if want_key {
                 // The returned value guard owns the mutable page and removes the entry on drop,
@@ -1336,6 +1355,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         if allow_in_place
             && self.page_allocator.uncommitted(page_number)
             && plan.disposition == LeafDeleteDisposition::Rebuild
+            && !plan.shrink
         {
             drop(page);
             let mut page_mut = self.page_allocator.get_page_mut(page_number)?;
@@ -1381,6 +1401,12 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         LeafDeletePlan {
             retained_pairs,
             disposition,
+            shrink: RawLeafBuilder::required_bytes(
+                retained_pairs,
+                retained_bytes,
+                K::fixed_width(),
+                V::fixed_width(),
+            ) < accessor.allocated_bytes() / 2,
         }
     }
 
@@ -1463,6 +1489,38 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     // exact. Writes in place when the branch page is uncommitted. Returns the
     // branch's resulting page number, and whether it is a new page whose
     // predecessor the caller must free.
+    fn evacuate_sibling<T: Page>(
+        &mut self,
+        accessor: &BranchAccessor<'_, T>,
+        modified_child: usize,
+    ) -> Result<Option<(usize, PageNumber, Checksum)>> {
+        if !self.page_allocator.can_evacuate() {
+            return Ok(None);
+        }
+        let candidate = (0..accessor.count_children())
+            .filter(|&index| index != modified_child)
+            .map(|index| (index, accessor.child_page(index).unwrap()))
+            .filter(|&(_, page)| !self.page_allocator.uncommitted(page))
+            .max_by_key(|&(_, page)| page);
+        let Some((index, page_number)) = candidate else {
+            return Ok(None);
+        };
+        let Some(replacement) = self
+            .page_allocator
+            .try_evacuate(page_number, self.allocated)?
+        else {
+            return Ok(None);
+        };
+        let result = replacement.get_page_number();
+        drop(replacement);
+        self.freed.push(page_number);
+        Ok(Some((
+            index,
+            result,
+            accessor.child_checksum(index).unwrap(),
+        )))
+    }
+
     fn replace_branch_child(
         &mut self,
         page: PageImpl,
@@ -1473,11 +1531,12 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         let original_page_number = page.get_page_number();
         let child_page_number = accessor.child_page(child_index).unwrap();
         let child_checksum = accessor.child_checksum(child_index).unwrap();
+        let evacuated = self.evacuate_sibling(&accessor, child_index)?;
         // Skip-path: the child's in-parent entry is already (child_page_number, DEFERRED)
         // and the mutated child kept its page number, so no write to this branch is needed.
         // This preserves the optimization from f8ccc39 without carrying a checksum on
         // `Subtree` (a modified `Subtree` always has checksum DEFERRED).
-        if new_child == child_page_number && child_checksum == DEFERRED {
+        if new_child == child_page_number && child_checksum == DEFERRED && evacuated.is_none() {
             return Ok((original_page_number, false));
         }
 
@@ -1486,6 +1545,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             let mut mutpage = self.page_allocator.get_page_mut(original_page_number)?;
             let mut mutator = BranchMutator::new(mutpage.memory_mut());
             mutator.write_child_page(child_index, new_child, DEFERRED);
+            if let Some((index, child, checksum)) = evacuated {
+                mutator.write_child_page(index, child, checksum);
+            }
             Ok((original_page_number, false))
         } else {
             let mut builder = BranchBuilder::new(
@@ -1496,6 +1558,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             );
             builder.push_all(&accessor);
             builder.replace_child(child_index, new_child, DEFERRED);
+            if let Some((index, child, checksum)) = evacuated {
+                builder.replace_child(index, child, checksum);
+            }
             let new_page = builder.build()?;
             Ok((new_page.get_page_number(), true))
         }
@@ -1803,6 +1868,20 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         drop(page);
         self.conditional_free(original_page_number);
 
+        // Merging a leaf also rebuilds its parent. Give that path the same bounded
+        // opportunity to evacuate a sibling as a deletion that kept its leaf.
+        if let Subtree(root) = &final_result
+            && self.page_allocator.can_evacuate()
+        {
+            let branch = self.page_allocator.get_page(*root, PageHint::None)?;
+            let accessor = BranchAccessor::new(&branch, K::fixed_width());
+            let evacuated = self.evacuate_sibling(&accessor, usize::MAX)?;
+            drop(branch);
+            if let Some((index, child, checksum)) = evacuated {
+                let mut branch = self.page_allocator.get_page_mut(*root)?;
+                BranchMutator::new(branch.memory_mut()).write_child_page(index, child, checksum);
+            }
+        }
         Ok(final_result)
     }
 

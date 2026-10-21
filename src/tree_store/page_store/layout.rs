@@ -121,7 +121,7 @@ impl DatabaseLayout {
         let region_header_pages = u64::from(region_header_pages_u32);
         let region_max_data_pages = u64::from(region_max_data_pages_u32);
         // Super-header
-        let mut remaining = file_len - page_size;
+        let mut remaining = file_len - page_size.max(512);
         let full_region_size = (region_header_pages + region_max_data_pages) * page_size;
         let full_regions = remaining / full_region_size;
         remaining -= full_regions * full_region_size;
@@ -235,7 +235,7 @@ impl DatabaseLayout {
 
     pub(super) fn region_base_address(&self, region: u32) -> u64 {
         assert!(region < self.num_regions());
-        u64::from(self.full_region_layout.page_size())
+        u64::from(self.full_region_layout.page_size()).max(512)
             + u64::from(region) * self.full_region_layout.len()
     }
 

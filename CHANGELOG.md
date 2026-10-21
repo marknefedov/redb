@@ -1,6 +1,11 @@
 # redb - Changelog
 
 ## 5.0.0 - 2026-XX-XX
+* This fork creates format v4 databases with 256-byte allocation units and exact contiguous
+  extents for ordinary tree nodes. Writes reuse gaps and move a bounded number of neighboring
+  nodes toward lower offsets. Hysteresis controls reclamation and file resizing, and durable
+  commits drain deferred garbage incrementally after old readers finish. Existing v3 files
+  retain their format; see `docs/space.md` for migration, work bounds, and benchmarks.
 * Under the `experimental-api-5` feature flag, turning off the `std` feature now builds redb as a
   `no_std` crate, for embedded targets. `alloc` is still required, as is `panic = "abort"` and a
   target with atomic compare-and-swap -- Cortex-M3 and above, but not Cortex-M0. The file backend

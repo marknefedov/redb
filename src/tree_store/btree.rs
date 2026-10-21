@@ -596,9 +596,9 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
                 self.page_allocator.get_page_mut(root.root)?
             } else {
                 let mut freed_pages = self.freed_pages.lock().unwrap();
-                let required: usize = root
-                    .root
-                    .page_size_bytes(self.page_allocator.get_page_size().try_into().unwrap())
+                let required: usize = self
+                    .page_allocator
+                    .allocation_bytes(root.root)
                     .try_into()
                     .unwrap();
                 let mut new_page = self
@@ -656,8 +656,9 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
                     self.page_allocator.get_page_mut(child_page)?
                 } else {
                     let mut freed_pages = self.freed_pages.lock().unwrap();
-                    let required: usize = child_page
-                        .page_size_bytes(self.page_allocator.get_page_size().try_into().unwrap())
+                    let required: usize = self
+                        .page_allocator
+                        .allocation_bytes(child_page)
                         .try_into()
                         .unwrap();
                     let mut new_page = self
@@ -1365,16 +1366,19 @@ mod tests {
             region: 0,
             page_index: 1,
             page_order: 0,
+            used_pages: 0,
         };
         let p2 = PageNumber {
             region: 0,
             page_index: 2,
             page_order: 0,
+            used_pages: 0,
         };
         let p3 = PageNumber {
             region: 0,
             page_index: 3,
             page_order: 0,
+            used_pages: 0,
         };
 
         let path = PagePath::new_root(p1);
@@ -1397,11 +1401,13 @@ mod tests {
             region: 0,
             page_index: 1,
             page_order: 0,
+            used_pages: 0,
         };
         let p2 = PageNumber {
             region: 0,
             page_index: 2,
             page_order: 0,
+            used_pages: 0,
         };
 
         let visited = [p1, p2];
@@ -1415,6 +1421,7 @@ mod tests {
             region: 0,
             page_index: 3,
             page_order: 0,
+            used_pages: 0,
         };
         assert!(!visited.contains(&p3));
     }

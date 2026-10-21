@@ -492,6 +492,10 @@ pub(crate) struct LeafAccessor<'a> {
 }
 
 impl<'a> LeafAccessor<'a> {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.page.len()
+    }
+
     pub(crate) fn new(
         page: &'a [u8],
         fixed_key_size: Option<usize>,
@@ -1008,7 +1012,7 @@ pub(super) fn leaf_split_required(
     ) && num_pairs > 1
 }
 
-// True when a leaf holding these pairs fits into a single order zero page.
+// True when these pairs fit within the target node size.
 pub(super) fn leaf_fits_one_page(
     num_pairs: usize,
     keys_values_bytes: usize,
@@ -1300,6 +1304,7 @@ impl<'b> LeafMutator<'b> {
 
     pub(super) fn sufficient_insert_inplace_space(
         page: &'_ impl Page,
+        node_size: usize,
         position: usize,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
@@ -1313,7 +1318,7 @@ impl<'b> LeafMutator<'b> {
             return false;
         }
         // If this is a large page, only allow in-place appending to avoid write amplification
-        if page.get_page_number().page_order > 0 && position < accessor.num_pairs() {
+        if page.memory().len() > node_size && position < accessor.num_pairs() {
             return false;
         }
         let remaining = page.memory().len() - accessor.total_length();
@@ -2327,17 +2332,29 @@ mod tests {
         let page_allocator = make_allocator();
         let allocated_pages = PageTracker::new_tracking();
         let keys = ascending_keys(MAX_PAIRS);
-        let page = build_leaf(&page_allocator, &allocated_pages, &keys);
+        let original = build_leaf(&page_allocator, &allocated_pages, &keys);
+        // Reserve spare capacity explicitly: v4 exact extents do not leave a buddy tail.
+        let mut page = page_allocator
+            .allocate(original.memory().len() + 4096, &allocated_pages)
+            .unwrap();
+        page.memory_mut()[..original.memory().len()].copy_from_slice(original.memory());
+        let original_number = original.get_page_number();
+        drop(original);
+        page_allocator.free(original_number, &allocated_pages);
 
         let accessor = LeafAccessor::new(page.memory(), u64::fixed_width(), None);
         assert_eq!(accessor.num_pairs(), MAX_PAIRS);
-        // The page must be a large (order > 0) page with free space remaining, so that
+        // The leaf must have free space remaining, so that
         // only the pair count limit can cause the append to be rejected
-        assert!(page.get_page_number().page_order > 0);
+        assert!(
+            page_allocator.allocation_bytes(page.get_page_number())
+                > page_allocator.get_page_size() as u64
+        );
         assert!(page.memory().len() - accessor.total_length() > 100);
 
         assert!(!LeafMutator::sufficient_insert_inplace_space(
             &page,
+            page_allocator.get_page_size(),
             MAX_PAIRS,
             u64::fixed_width(),
             None,
@@ -2353,11 +2370,24 @@ mod tests {
         let allocated_pages = PageTracker::new_tracking();
         let keys = ascending_keys(MAX_PAIRS - 1);
         let mut page = build_leaf(&page_allocator, &allocated_pages, &keys);
-        assert!(page.get_page_number().page_order > 0);
+        assert!(
+            page_allocator.allocation_bytes(page.get_page_number())
+                > page_allocator.get_page_size() as u64
+        );
 
         let key = ((MAX_PAIRS - 1) as u64).to_le_bytes();
+        assert!(!LeafMutator::sufficient_insert_inplace_space(
+            &page,
+            page_allocator.get_page_size(),
+            0,
+            u64::fixed_width(),
+            None,
+            &key,
+            &[],
+        ));
         assert!(LeafMutator::sufficient_insert_inplace_space(
             &page,
+            page_allocator.get_page_size(),
             MAX_PAIRS - 1,
             u64::fixed_width(),
             None,

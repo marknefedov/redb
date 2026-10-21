@@ -86,6 +86,11 @@ coverage:
 bench bench='redb_benchmark': pre
     ./scripts/podman-sandbox.sh 'REDB_BENCHMARK_DIR=/scratch cargo bench --frozen -p redb-bench -p redb-bench-compare --bench {{bench}}'
 
+# Standalone, repeatable space/latency comparison. No redb compaction is invoked.
+bench_space entries='512000' output='space-results.json':
+    REDB_SPACE_ENTRIES={{quote(entries)}} REDB_SPACE_OUTPUT={{quote(absolute_path(output))}} cargo bench -p redb-bench-compare --bench space_benchmark
+    python3 scripts/space-report.py {{quote(output)}} --output {{quote(output + '.md')}} --max-ratio 1.5
+
 build_bench_container:
     docker build -t redb-bench:latest -f Dockerfile.bench .
 

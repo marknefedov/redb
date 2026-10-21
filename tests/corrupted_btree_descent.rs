@@ -9,6 +9,10 @@ const T: TableDefinition<u64, u64> = TableDefinition::new("t");
 const BRANCH: u8 = 2;
 const PAGE_SIZE: usize = 4096;
 
+fn allocation_size(data: &[u8]) -> usize {
+    u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize
+}
+
 fn create_tempfile() -> tempfile::NamedTempFile {
     if cfg!(target_os = "wasi") {
         tempfile::NamedTempFile::new_in("/tmp").unwrap()
@@ -21,22 +25,23 @@ fn create_tempfile() -> tempfile::NamedTempFile {
 fn region_size(data: &[u8]) -> u64 {
     let region_header_pages = u64::from(u32::from_le_bytes(data[16..20].try_into().unwrap()));
     let region_max_data_pages = u64::from(u32::from_le_bytes(data[20..24].try_into().unwrap()));
-    (region_header_pages + region_max_data_pages) * PAGE_SIZE as u64
+    (region_header_pages + region_max_data_pages) * allocation_size(data) as u64
 }
 
 // Offsets of every page that looks like a branch. Some belong to the system tree, and some are
 // stale pages left by earlier commits; the caller sorts out which are usable.
 fn branch_page_offsets(data: &[u8]) -> Vec<usize> {
     let mut offsets = vec![];
-    // The super-header occupies the first page
-    let mut offset = PAGE_SIZE;
-    while offset + PAGE_SIZE <= data.len() {
-        let page = &data[offset..offset + PAGE_SIZE];
+    let unit = allocation_size(data);
+    let mut offset = unit.max(512);
+    while offset + 8 <= data.len() {
+        let page = &data[offset..(offset + PAGE_SIZE).min(data.len())];
         let num_keys = u16::from_le_bytes([page[2], page[3]]) as usize;
-        if page[0] == BRANCH && num_keys > 0 && 8 + 24 * (num_keys + 1) <= PAGE_SIZE {
+        if page[0] == BRANCH && num_keys > 0 && 8 + 24 * (num_keys + 1) + 8 * num_keys <= page.len()
+        {
             offsets.push(offset);
         }
-        offset += PAGE_SIZE;
+        offset += unit;
     }
     offsets
 }
@@ -45,14 +50,19 @@ fn branch_page_offsets(data: &[u8]) -> Vec<usize> {
 // direction hits the cycle. Reads do not verify checksums, so the stale checksum does not matter.
 fn make_self_referential(data: &mut [u8], offset: usize) {
     let region_size = region_size(data);
-    let relative = (offset - PAGE_SIZE) as u64;
+    let unit = allocation_size(data);
+    let relative = (offset - unit.max(512)) as u64;
     let region = relative / region_size;
-    let index = (relative % region_size) / PAGE_SIZE as u64;
-    // order 0, so the page number is just the region and index
-    let self_reference = (region << 20) | index;
+    let index = (relative % region_size) / unit as u64;
+    let mut self_reference = (region << 20) | (index & 0xF_FFFF) | ((index >> 20) << 40);
 
-    let page = &mut data[offset..offset + PAGE_SIZE];
+    let end = (offset + PAGE_SIZE).min(data.len());
+    let page = &mut data[offset..end];
     let num_keys = u16::from_le_bytes([page[2], page[3]]) as usize;
+    if unit == 256 {
+        let required = 8 + 24 * (num_keys + 1) + 8 * num_keys;
+        self_reference |= (required.div_ceil(unit) as u64) << 44;
+    }
     // Child pointers follow the per-child checksums, which follow an 8 byte header
     let children = 8 + 16 * (num_keys + 1);
     for i in 0..=num_keys {
@@ -64,7 +74,8 @@ fn make_self_referential(data: &mut [u8], offset: usize) {
 // Makes one child pointer unreadable by corrupting its page-order bits: descending into it
 // reports Corrupted, without latching an I/O failure
 fn corrupt_child_pointer(data: &mut [u8], offset: usize, child: usize) {
-    let page = &mut data[offset..offset + PAGE_SIZE];
+    let end = (offset + PAGE_SIZE).min(data.len());
+    let page = &mut data[offset..end];
     let num_keys = u16::from_le_bytes([page[2], page[3]]) as usize;
     assert!(child <= num_keys);
     // Child pointers follow the per-child checksums, which follow an 8 byte header

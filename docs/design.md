@@ -11,6 +11,9 @@ serializable, in which all writes are applied sequentially.
 Each table is a key-value mapping providing an interface similar to `BTreeMap`.
 
 # File format
+This fork creates format v4 databases. The v3 layout below remains supported for existing files;
+see [bounded space reclamation](space.md) for the v4 allocation geometry and work limits.
+
 Logically, a redb database file consists of some metadata, and several B+trees:
 * pending free tree: mapping from transaction ids to the list of pages they freed
 * table tree: name -> table definition mapping of table names to their definitions
@@ -680,6 +683,16 @@ Some features are not supported in multi-process concurrency modes.
 * Ephemeral savepoints are not supported in multi-writer mode.
 
 # Version changes
+## v4 (fork)
+* Separate the target tree-node size (default 4096 bytes) from 256-byte allocation units.
+* Reserve a minimum 512-byte super-header; store target node size at super-header offset 32.
+* Use pointer bits 40..44 for four additional page-index bits, and bits 44..59 for an exact
+  extent length. A nonzero length uses an absolute base-page index and order zero. A zero
+  length retains the buddy-block encoding, including for large values.
+* Derive contiguous-run indices from the persisted buddy bitmap on open/reload. Augmented
+  AVL trees index free extents and regions by address, supporting lowest-fit allocation in
+  logarithmic time. Exact lengths extend through 32767 units.
+
 ## v1
 Initial file format
 

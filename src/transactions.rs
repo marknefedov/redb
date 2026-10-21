@@ -950,6 +950,12 @@ pub struct WriteTransaction {
     savepoint_state: Mutex<SavepointTransactionState>,
 }
 
+// Retains the completed transaction's writer guard until its caller publishes associated
+// in-memory state. It exposes no operations that could change the committed transaction.
+pub(crate) struct CommittedWrite {
+    _transaction: WriteTransaction,
+}
+
 impl WriteTransaction {
     pub(crate) fn new(
         guard: TransactionGuard,
@@ -1769,6 +1775,21 @@ impl WriteTransaction {
             return Err(CommitError::TransactionPoisoned);
         }
         self.commit_inner(header_lock)
+    }
+
+    // Capture the visible id, including a cleanup epilogue, while retaining the writer guard.
+    // The caller releases its publication lock before dropping the completed transaction.
+    pub(crate) fn commit_and_hold(
+        mut self,
+    ) -> Result<(TransactionId, CommittedWrite), CommitError> {
+        self.completed = true;
+        if self.is_poisoned() {
+            self.abort_inner()?;
+            return Err(CommitError::TransactionPoisoned);
+        }
+        self.commit_inner(None)?;
+        let id = self.mem.get_last_committed_transaction_id()?;
+        Ok((id, CommittedWrite { _transaction: self }))
     }
 
     fn commit_inner(&mut self, header_lock: Option<&HeaderGuard<'_>>) -> Result<(), CommitError> {
@@ -2787,6 +2808,17 @@ pub struct ReadTransaction {
 }
 
 impl ReadTransaction {
+    pub(crate) fn snapshot_id(&self) -> TransactionId {
+        self.tree.transaction_guard().id()
+    }
+
+    pub(crate) fn table_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<InternalTableDefinition>, TableError> {
+        Ok(self.tree.get_definition(name)?)
+    }
+
     pub(crate) fn new(
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,

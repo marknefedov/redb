@@ -684,6 +684,10 @@ impl core::error::Error for CursorError {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// An optimistic transaction read data that another writer changed.
+    ConcurrentWriteConflict {
+        table: String,
+    },
     /// The Database is already open. Cannot acquire lock.
     DatabaseAlreadyOpen,
     /// Another process has the database open with a version of redb that implements a different
@@ -758,6 +762,21 @@ pub enum Error {
     ReadTransactionStillInUse(Box<ReadTransaction>),
 }
 
+impl From<crate::ConcurrentWriteError> for Error {
+    fn from(error: crate::ConcurrentWriteError) -> Self {
+        match error {
+            crate::ConcurrentWriteError::Conflict { table } => {
+                Self::ConcurrentWriteConflict { table }
+            }
+            crate::ConcurrentWriteError::Storage(error) => error.into(),
+            crate::ConcurrentWriteError::Table(error) => error.into(),
+            crate::ConcurrentWriteError::Transaction(error) => error.into(),
+            crate::ConcurrentWriteError::Commit(error) => error.into(),
+            crate::ConcurrentWriteError::Durability(error) => error.into(),
+        }
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(_: PoisonError<T>) -> Error {
         Error::LockPoisoned(panic::Location::caller())
@@ -773,6 +792,9 @@ impl From<io::Error> for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self {
+            Error::ConcurrentWriteConflict { table } => {
+                write!(f, "Concurrent write conflict in table {table}")
+            }
             Error::Unsupported => BackendError::Unsupported.fmt(f),
             Error::Corrupted(msg) => {
                 write!(f, "DB corrupted: {msg}")

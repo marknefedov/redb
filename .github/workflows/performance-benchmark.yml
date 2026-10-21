@@ -1,0 +1,323 @@
+name: Performance benchmark
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline commit or ref
+        default: master
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-benchmark-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_BENCH_DEBUG: 0
+      REDB_PERF_ENTRIES: 65536
+      REDB_PERF_BATCH: 64
+      REDB_PERF_REPEATS: 1
+      REDB_PERF_MODES: memory,durable
+      REDB_PERF_VALUES: 150,4096
+      REDB_CONCURRENT_MODES: memory,durable
+      REDB_CONCURRENT_WRITERS: 1,2,4
+      REDB_CONCURRENT_TRANSACTIONS: 1024
+      REDB_CONCURRENT_PREPARATION_READS: 64
+      REDB_CONCURRENT_MAX_RETRIES: 16384
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Validate report parser
+        run: python3 -m unittest discover -s scripts -p test_performance_report.py
+      - name: Prepare identical harnesses
+        id: revisions
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base_ref }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          root = Path.cwd()
+          baseline = Path(os.environ['RUNNER_TEMP']) / 'performance-base'
+          baseline_ref = os.environ['BASE_REF']
+          try:
+              base = subprocess.check_output(['git', 'rev-parse', '--verify', '--end-of-options', baseline_ref + '^{commit}'], text=True, stderr=subprocess.DEVNULL).strip()
+          except subprocess.CalledProcessError:
+              base = subprocess.check_output(['git', 'rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/' + baseline_ref + '^{commit}'], text=True).strip()
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          subprocess.run(['git', 'worktree', 'add', '--detach', str(baseline), base], check=True)
+          # Both engines execute the PR's same harness; engine source stays at its exact revision.
+          for relative in ('crates/redb-bench/Cargo.toml', 'rust-toolchain'):
+              shutil.copy2(root / relative, baseline / relative)
+          # Other declared bench targets may use new APIs; Cargo only compiles performance_benchmark here.
+          shutil.copytree(root / 'crates/redb-bench/benches', baseline / 'crates/redb-bench/benches', dirs_exist_ok=True)
+          for directory in (root, baseline):
+              subprocess.run(['cargo', 'generate-lockfile'], cwd=directory, check=True)
+          shutil.copy2(baseline / 'Cargo.lock', root / '.performance-base.lock')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'base={base}\nhead={head}\n')
+          PY
+      - uses: actions/cache/restore@v5
+        id: bench-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ runner.temp }}/performance-target-base/release
+            ${{ runner.temp }}/performance-target-head/release
+          key: performance-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.performance-base.lock', '**/Cargo.toml', 'rust-toolchain', '.github/workflows/performance-benchmark.yml') }}
+      - name: Build both revisions
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          binaries = temporary / 'performance-binaries'
+          binaries.mkdir()
+          for revision, directory in (('base', temporary / 'performance-base'), ('head', Path.cwd())):
+              environment = os.environ.copy()
+              environment['CARGO_TARGET_DIR'] = str(temporary / f'performance-target-{revision}')
+              targets = ['performance_benchmark']
+              if revision == 'head':
+                  targets.append('concurrent_write_benchmark')
+              command = ['cargo', 'bench', '--locked', '--no-run', '--message-format=json', '-p', 'redb-bench']
+              for target in targets:
+                  command.extend(['--bench', target])
+              build_log = temporary / f'performance-build-{revision}.jsonl'
+              try:
+                  with build_log.open('w') as output:
+                      subprocess.run(command, cwd=directory, env=environment, stdout=output, check=True)
+              except subprocess.CalledProcessError:
+                  for line in build_log.read_text().splitlines():
+                      message = json.loads(line)
+                      if message.get('reason') == 'compiler-message':
+                          print(message['message'].get('rendered', message['message']['message']), file=sys.stderr)
+                  raise
+              executables = {}
+              for line in build_log.read_text().splitlines():
+                  message = json.loads(line)
+                  if message.get('reason') == 'compiler-artifact' and message['target']['name'] in targets and message.get('executable'):
+                      executables[message['target']['name']] = message['executable']
+              for target in targets:
+                  destination = revision if target == 'performance_benchmark' else 'concurrent'
+                  shutil.copy2(executables[target], binaries / destination)
+          PY
+      - name: Save compiled harnesses
+        if: steps.bench-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ runner.temp }}/performance-target-base/release
+            ${{ runner.temp }}/performance-target-head/release
+          key: ${{ steps.bench-cache.outputs.cache-primary-key }}
+      - name: Compare sequential counterbalanced runs
+        env:
+          BASE_SHA: ${{ steps.revisions.outputs.base }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          order = ['base', 'head', 'head', 'base']
+          results = []
+          for index, revision in enumerate(order):
+              output = temporary / f'performance-{index}.json'
+              environment = os.environ.copy()
+              environment['REDB_PERF_OUTPUT'] = str(output)
+              subprocess.run([str(temporary / 'performance-binaries' / revision)], env=environment, check=True)
+              results.append({'revision': revision, 'report': json.loads(output.read_text())})
+          concurrent_output = temporary / 'performance-concurrent.json'
+          environment = os.environ.copy()
+          environment['REDB_CONCURRENT_OUTPUT'] = str(concurrent_output)
+          subprocess.run([str(temporary / 'performance-binaries/concurrent')], env=environment, check=True)
+          Path('performance-results.json').write_text(json.dumps({
+              'schema': 1, 'base_sha': os.environ['BASE_SHA'], 'head_sha': os.environ['HEAD_SHA'],
+              'order': order, 'runs': results, 'concurrent': json.loads(concurrent_output.read_text()),
+          }, indent=2))
+          PY
+      - name: Render comparison
+        run: python3 scripts/performance-report.py performance-results.json --output performance-results.md
+      - name: Job summary
+        run: cat performance-results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-results
+          path: performance-results.json
+          if-no-files-found: error
+
+  comment:
+    needs: benchmark
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: performance-results
+          path: performance-artifact
+      # No checkout or execution of benchmark code in this job with a write token.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'performance-artifact/performance-results.json';
+            if (fs.statSync(path).size > 256 * 1024) throw new Error('Oversized report');
+            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const number = (value, min = 0, max = Number.MAX_SAFE_INTEGER) => {
+              if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error('Invalid numeric result');
+              return value;
+            };
+            const sha = value => {
+              if (typeof value !== 'string' || value.length !== 40 || !/^[0-9a-f]{40}$/.test(value)) throw new Error('Invalid commit SHA');
+              return value;
+            };
+            const choices = (values, allowed) => {
+              if (!Array.isArray(values) || !values.length || values.length > allowed.length ||
+                  values.some(value => !allowed.includes(value)) || new Set(values).size !== values.length)
+                throw new Error('Invalid workload configuration');
+              return values;
+            };
+            const order = ['base', 'head', 'head', 'base'];
+            const phases = ['load', 'churn', 'random_read'];
+            if (number(data.schema) !== 1 || JSON.stringify(data.order) !== JSON.stringify(order) ||
+                !Array.isArray(data.runs) || data.runs.length !== 4) throw new Error('Invalid comparison schema');
+            const base = sha(data.base_sha), head = sha(data.head_sha);
+            let configuration;
+            const grouped = {base: new Map(), head: new Map()};
+            for (let index = 0; index < 4; index++) {
+              const run = data.runs[index], report = run.report;
+              if (run.revision !== order[index] || number(report.schema) !== 1) throw new Error('Invalid execution order');
+              const entries = number(report.entries, 1), batch = number(report.batch_size, 1);
+              const repeats = number(report.repeats, 1, 10);
+              const modes = choices(report.modes, ['memory', 'durable']);
+              const sizes = choices(report.value_bytes, [150, 4096]);
+              const config = [entries, batch, repeats, modes, sizes];
+              if (configuration && JSON.stringify(config) !== JSON.stringify(configuration)) throw new Error('Mismatched configurations');
+              configuration = config;
+              if (!Array.isArray(report.results) || report.results.length !== repeats * modes.length * sizes.length * phases.length)
+                throw new Error('Incomplete results');
+              const samples = Math.ceil(entries / batch), seen = new Set();
+              for (const row of report.results) {
+                const round = number(row.round, 1, repeats), size = number(row.value_bytes);
+                if (!modes.includes(row.mode) || !sizes.includes(size) || !phases.includes(row.phase)) throw new Error('Invalid workload');
+                const unique = `${round}/${row.mode}/${size}/${row.phase}`;
+                if (seen.has(unique)) throw new Error('Duplicate workload');
+                seen.add(unique);
+                const operations = number(row.operations), transactions = number(row.transactions);
+                const elapsed = number(row.elapsed_ns, 1), throughput = number(row.ops_per_second, 1);
+                const transactionRate = number(row.transactions_per_second);
+                if (operations !== entries * (row.phase === 'churn' ? 2 : 1) || number(row.samples) !== samples ||
+                    transactions !== (row.phase === 'random_read' ? 1 : samples) ||
+                    BigInt(throughput) !== BigInt(operations) * 1000000000n / BigInt(elapsed) ||
+                    BigInt(transactionRate) !== BigInt(transactions) * 1000000000n / BigInt(elapsed))
+                  throw new Error('Inconsistent counts or rates');
+                const latency = ['p50', 'p99', 'p999', 'max'].map(name => number(row.latency_ns[name]));
+                if (latency.some((value, i) => i && value < latency[i - 1])) throw new Error('Invalid latency ordering');
+                const key = `${row.mode}/${size}/${row.phase}`, rows = grouped[run.revision].get(key) || [];
+                rows.push({throughput, latency});
+                grouped[run.revision].set(key, rows);
+              }
+            }
+            const [entries, batch, repeats, modes, sizes] = configuration;
+            const median = values => {
+              values.sort((a, b) => a - b);
+              const middle = Math.floor(values.length / 2);
+              return values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+            };
+            const lines = [
+              `Base \`${base}\`; head \`${head}\`.`,
+              `${entries} initial entries; ${batch} records per batch. Execution order: base, head, head, base; ${2 * repeats} measurements per revision.`,
+              'Throughput is median [min, max]. Latency columns show the worst reported p99 / p99.9 / max across runs.', '',
+              '| Backend | Value bytes | Workload | Base ops/s [range] | Head ops/s [range] | Head/base | Base p99 / p99.9 / max ms | Head p99 / p99.9 / max ms |',
+              '|---|---:|---|---:|---:|---:|---:|---:|'
+            ];
+            for (const mode of modes) for (const size of sizes) for (const phase of phases) {
+              const key = `${mode}/${size}/${phase}`;
+              const stats = ['base', 'head'].map(label => {
+                const rows = grouped[label].get(key), rates = rows.map(row => row.throughput);
+                return {rate: median([...rates]), min: Math.min(...rates), max: Math.max(...rates),
+                  tails: [1, 2, 3].map(index => Math.max(...rows.map(row => row.latency[index])))};
+              });
+              const rates = stats.map(s => `${s.rate.toFixed(0)} [${s.min}, ${s.max}]`);
+              const tails = stats.map(s => s.tails.map(value => (value / 1000000).toFixed(3)).join(' / '));
+              lines.push(`| ${mode} | ${size} | ${phase} | ${rates[0]} | ${rates[1]} | ${(stats[1].rate / stats[0].rate).toFixed(3)}x | ${tails[0]} | ${tails[1]} |`);
+            }
+            lines.push('', 'Both backends use Immediate commits. Memory isolates engine CPU work; durable uses a file with synchronous commits. Write batch latency includes begin, mutations, and commit; read batch latency covers lookups in one held snapshot. Churn counts each removal and insertion as an operation. Dataset generation and verification are outside timing. Shared-runner timing is diagnostic; there is no performance gate. The separate space benchmark keeps its 1.5x size gate.');
+            if (Object.prototype.hasOwnProperty.call(data, 'concurrent')) {
+              const report = data.concurrent;
+              if (number(report.schema) !== 1 || number(report.value_bytes) !== 150) throw new Error('Invalid writer schema');
+              const transactions = number(report.transactions_per_writer, 1);
+              const references = number(report.reference_keys, 1), preparation = number(report.preparation_reads, 0, references);
+              const retryLimit = number(report.max_retries);
+              const modes = choices(report.modes, ['memory', 'durable']), writers = choices(report.writers, [1, 2, 4, 8]);
+              const apis = ['classic', 'concurrent'], workloads = ['independent', 'hot_key'];
+              if (!Array.isArray(report.results) || report.results.length !== modes.length * writers.length * apis.length * workloads.length)
+                throw new Error('Incomplete writer results');
+              const grouped = new Map();
+              for (const row of report.results) {
+                const count = number(row.writers, 1);
+                if (!modes.includes(row.mode) || !apis.includes(row.api) || !workloads.includes(row.workload) || !writers.includes(count))
+                  throw new Error('Invalid writer workload');
+                const key = `${row.mode}/${row.workload}/${count}/${row.api}`;
+                if (grouped.has(key)) throw new Error('Duplicate writer workload');
+                const total = number(row.transactions, 1), attempts = number(row.attempts, 1);
+                const conflicts = number(row.conflicts), retries = number(row.retries);
+                const elapsed = number(row.elapsed_ns, 1), rate = number(row.transactions_per_second, 1);
+                const bytes = number(row.backend_bytes, 1);
+                const latency = ['p50', 'p99', 'p999', 'max'].map(name => number(row.latency_ns[name]));
+                if (total !== transactions * count || attempts !== total + conflicts || retries !== conflicts ||
+                    BigInt(retries) > BigInt(total) * BigInt(retryLimit) || (row.api === 'classic' && conflicts !== 0) ||
+                    BigInt(rate) !== BigInt(total) * 1000000000n / BigInt(elapsed) ||
+                    latency.some((value, i) => i && value < latency[i - 1])) throw new Error('Inconsistent writer result');
+                grouped.set(key, {rate, attempts, conflicts, bytes, latency});
+              }
+              lines.push('', '### Head-only writer contention', '',
+                `${transactions} committed transactions per writer; ${preparation} preparation reads from ${references} reference keys per attempt; 150-byte values; at most ${retryLimit} retries per logical transaction.`,
+                'Both APIs use Immediate commits. Independent writers update separate counters; hot-key writers share a counter. Latency includes all retries for each committed logical transaction. This compares APIs on the head commit, not against the base commit.', '',
+                '| Backend | Workload | Writers | Classic tx/s | Concurrent tx/s | Concurrent/classic | Conflicts / attempts | Classic p99 / p99.9 / max ms | Concurrent p99 / p99.9 / max ms | Classic / concurrent KiB |',
+                '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|');
+              for (const mode of modes) for (const workload of workloads) for (const count of writers) {
+                const classic = grouped.get(`${mode}/${workload}/${count}/classic`);
+                const concurrent = grouped.get(`${mode}/${workload}/${count}/concurrent`);
+                const tails = [classic, concurrent].map(row => row.latency.slice(1).map(value => (value / 1000000).toFixed(3)).join(' / '));
+                lines.push(`| ${mode} | ${workload} | ${count} | ${classic.rate} | ${concurrent.rate} | ${(concurrent.rate / classic.rate).toFixed(3)}x | ${concurrent.conflicts} / ${concurrent.attempts} | ${tails[0]} | ${tails[1]} | ${(classic.bytes / 1024).toFixed(1)} / ${(concurrent.bytes / 1024).toFixed(1)} |`);
+              }
+            }
+            const issue_number = context.issue.number;
+            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: issue_number});
+            if (head !== context.payload.pull_request.head.sha || pr.head.sha !== head || pr.state !== 'open') return;
+            const marker = '<!-- redb-performance-benchmark -->';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `${marker}\n${lines.join('\n')}\n\n[Benchmark run](${runUrl})`;
+            const comments = await github.paginate(github.rest.issues.listComments, {...context.repo, issue_number});
+            const existing = comments.find(comment => comment.user.type === 'Bot' && comment.body.startsWith(marker));
+            if (existing) await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
+            else await github.rest.issues.createComment({...context.repo, issue_number, body});

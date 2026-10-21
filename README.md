@@ -43,6 +43,8 @@ are any future changes to it.
 * Zero-copy, thread-safe, `BTreeMap` based API
 * Fully ACID-compliant transactions
 * MVCC support for concurrent readers & writer, without blocking
+* [Optimistic transactions](docs/concurrent-writes.md) that let multiple writers prepare
+  changes concurrently, with explicit conflict detection at commit
 * Crash-safe by default
 * Savepoints and rollbacks
 

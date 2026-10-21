@@ -91,6 +91,14 @@ bench_space entries='512000' output='space-results.json':
     REDB_SPACE_ENTRIES={{quote(entries)}} REDB_SPACE_OUTPUT={{quote(absolute_path(output))}} cargo bench -p redb-bench-compare --bench space_benchmark
     python3 scripts/space-report.py {{quote(output)}} --output {{quote(output + '.md')}} --max-ratio 1.5
 
+# CPU and synchronous file workloads, without building comparison engines.
+bench_performance entries='65536' output='performance-results.json':
+    REDB_PERF_ENTRIES={{quote(entries)}} REDB_PERF_OUTPUT={{quote(absolute_path(output))}} cargo bench -p redb-bench --bench performance_benchmark
+
+# Classic/concurrent write APIs under independent and hot-key contention.
+bench_concurrent transactions='1024' output='concurrent-results.json':
+    REDB_CONCURRENT_TRANSACTIONS={{quote(transactions)}} REDB_CONCURRENT_OUTPUT={{quote(absolute_path(output))}} cargo bench -p redb-bench --bench concurrent_write_benchmark
+
 build_bench_container:
     docker build -t redb-bench:latest -f Dockerfile.bench .
 

@@ -180,6 +180,7 @@ pub(crate) struct PageAllocator {
     mem: Arc<TransactionalMemory>,
     policy: AllocationPolicy,
     allocated_since_commit: Arc<UncommittedPages>,
+    evacuation_scans: Arc<AtomicUsize>,
     evacuation_attempts: Arc<AtomicUsize>,
     evacuation_bytes: Arc<AtomicUsize>,
 }
@@ -190,6 +191,7 @@ impl PageAllocator {
             mem,
             policy,
             allocated_since_commit: Arc::new(UncommittedPages::new()),
+            evacuation_scans: Arc::new(AtomicUsize::new(256)),
             evacuation_attempts: Arc::new(AtomicUsize::new(256)),
             evacuation_bytes: Arc::new(AtomicUsize::new(1024 * 1024)),
         }
@@ -339,7 +341,20 @@ impl PageAllocator {
 
     pub(crate) fn can_evacuate(&self) -> bool {
         self.mem.format_version == FILE_FORMAT_VERSION4
+            && self.evacuation_scans.load(Ordering::Relaxed) > 0
             && self.evacuation_attempts.load(Ordering::Relaxed) > 0
+    }
+
+    // Candidate discovery also has a budget: a branch containing only uncommitted
+    // children must not keep scanning without ever spending a relocation attempt.
+    pub(crate) fn begin_evacuation_scan(&self) -> bool {
+        self.can_evacuate()
+            && self
+                .evacuation_scans
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
     }
 
     pub(crate) fn allocation_bytes(&self, page: PageNumber) -> u64 {
@@ -2883,6 +2898,16 @@ mod test {
         }
         assert!(!allocator.can_evacuate() && !clone.can_evacuate());
         assert_eq!(allocator.mem.count_allocated_pages().unwrap(), 16);
+
+        // Searches without a committed candidate must exhaust their shared budget too.
+        let scan_only = PageAllocator::new(allocator.mem.clone(), AllocationPolicy::Lowest);
+        let clone = scan_only.clone();
+        for index in 0..256 {
+            let selected = if index % 2 == 0 { &scan_only } else { &clone };
+            assert!(selected.begin_evacuation_scan());
+        }
+        assert!(!scan_only.begin_evacuation_scan() && !clone.begin_evacuation_scan());
+        assert!(!scan_only.can_evacuate() && !clone.can_evacuate());
     }
 
     // Test that the region tracker expansion code works, by adding more data than fits into the initial max regions

@@ -147,6 +147,30 @@ impl Node {
         }
         self.right.as_ref()?.first_fit(len, lower)
     }
+
+    fn take_first_fit(root: &mut Option<Box<Self>>, len: u32) -> Option<u32> {
+        let node = root.as_mut()?;
+        if node.max_len < len {
+            return None;
+        }
+        let result = if Self::max_len(node.left.as_deref()) >= len {
+            Self::take_first_fit(&mut node.left, len)
+        } else if node.len >= len {
+            let start = node.start;
+            if node.len == len {
+                let previous = Self::remove(root, start);
+                debug_assert_eq!(previous, Some(len));
+                return Some(start);
+            }
+            node.start += len;
+            node.len -= len;
+            Some(start)
+        } else {
+            Self::take_first_fit(&mut node.right, len)
+        };
+        Self::balance(root);
+        result
+    }
 }
 
 impl ExtentIndex {
@@ -164,6 +188,13 @@ impl ExtentIndex {
 
     pub(super) fn first_fit_from(&self, len: u32, lower: u32) -> Option<u32> {
         self.root.as_ref()?.first_fit(len, lower)
+    }
+
+    // Consume the prefix of the lowest fitting extent. Extents must not overlap,
+    // so moving its start within that extent preserves the index ordering.
+    pub(super) fn take_first_fit(&mut self, len: u32) -> Option<u32> {
+        assert!(len > 0);
+        Node::take_first_fit(&mut self.root, len)
     }
 
     pub(super) fn max_len(&self) -> u32 {
@@ -269,6 +300,60 @@ mod tests {
                 index.ceiling(key),
                 reference.range(key..).next().map(|(&k, &v)| (k, v))
             );
+        }
+    }
+
+    #[test]
+    fn consuming_prefixes_matches_an_ordered_map_and_stays_balanced() {
+        for order in 0..3 {
+            let mut index = ExtentIndex::default();
+            let mut reference = BTreeMap::new();
+            for ordinal in 0..128 {
+                let key = match order {
+                    0 => ordinal,
+                    1 => 127 - ordinal,
+                    _ => ordinal * 73 % 128,
+                };
+                let len = key % 31 + 1;
+                index.insert(key * 64, len);
+                reference.insert(key * 64, len);
+            }
+            for request in [1, 17, 5, 31, 32].into_iter().cycle().take(1000) {
+                let expected = reference
+                    .iter()
+                    .find(|&(_, &len)| len >= request)
+                    .map(|(&start, &len)| (start, len));
+                assert_eq!(
+                    index.take_first_fit(request),
+                    expected.map(|(start, _)| start)
+                );
+                if let Some((start, len)) = expected {
+                    reference.remove(&start);
+                    if len > request {
+                        reference.insert(start + request, len - request);
+                    }
+                }
+                validate(index.root.as_deref(), None, None);
+                assert_eq!(
+                    index.max_len(),
+                    reference.values().copied().max().unwrap_or(0)
+                );
+                for request in [1, 7, 31] {
+                    assert_eq!(
+                        index.first_fit(request),
+                        reference
+                            .iter()
+                            .find(|&(_, &len)| len >= request)
+                            .map(|(&start, _)| start)
+                    );
+                }
+            }
+            while let Some((&start, &len)) = reference.iter().next() {
+                assert_eq!(index.take_first_fit(len), Some(start));
+                reference.remove(&start);
+                validate(index.root.as_deref(), None, None);
+            }
+            assert_eq!(index.take_first_fit(1), None);
         }
     }
 }

@@ -238,7 +238,7 @@ impl BuddyAllocator {
     // The augmented address index finds the lowest fit without scanning holes.
     pub(crate) fn alloc_run(&mut self, count: u32) -> Option<u32> {
         assert!(count > 0);
-        let start = self.free_runs.first_fit(count)?;
+        let start = self.free_runs.take_first_fit(count)?;
         let mut remaining = count;
         let mut offset = start;
         while remaining > 0 {
@@ -248,7 +248,6 @@ impl BuddyAllocator {
             offset += len;
             remaining -= len;
         }
-        self.take_run(start, count);
         self.free_pages -= count;
         Some(start)
     }

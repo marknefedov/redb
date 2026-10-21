@@ -180,6 +180,10 @@ impl TableTree {
         }
     }
 
+    pub(crate) fn get_definition(&self, name: &str) -> Result<Option<InternalTableDefinition>> {
+        Ok(self.tree.get(&name)?.map(|entry| entry.value()))
+    }
+
     // root_page: the root of the master table
     pub(crate) fn get_table<K: Key, V: Value>(
         &self,
